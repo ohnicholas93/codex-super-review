@@ -1,0 +1,662 @@
+#!/usr/bin/env python3
+"""Codex Super Review orchestration CLI."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_IMPLEMENTER_MODEL = "gpt-5.5 medium"
+DEFAULT_REVIEWER_MODEL = "gpt-5.4 xhigh"
+REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+
+PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.
+
+If you find no actionable issues, your final response must be exactly:
+
+NO_FINDINGS
+
+If you do find issues, do not include the string NO_FINDINGS anywhere in your response."""
+
+PROMPT_VALIDATE_FIX_COMMENTS = """Another developer wrote these comments regarding your changes (currently uncommitted in git). Please verify and check the correctness and applicability of their findings. If their concerns are valid and appropriate, please fix and address them."""
+
+PROMPT_REVERIFY_FIXES = """Can you recheck now if all concerns have been successfully fixed, and if any other issues persist or cropped up since?
+
+If all concerns are resolved and you find no actionable issues, your final response must be exactly:
+
+NO_FINDINGS
+
+If you do find issues, do not include the string NO_FINDINGS anywhere in your response."""
+
+PROMPT_VALIDATE_FOLLOWUP_COMMENTS = """The reviewing developer returned with the following notes. Please verify and check the correctness and applicability of their findings. If their concerns are valid and appropriate, please fix and address them."""
+
+NO_FINDINGS = "NO_FINDINGS"
+
+
+@dataclass
+class CodexResult:
+    command: list[str]
+    returncode: int
+    response: str
+    thread_id: str | None
+    usage: dict[str, Any] | None
+    event_types: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    raw: str
+    model: str
+    reasoning_effort: str
+
+    @property
+    def display(self) -> str:
+        return f"{self.model} {self.reasoning_effort}"
+
+
+class CodexExecutableNotFound(RuntimeError):
+    pass
+
+
+class CodexRunFailure(RuntimeError):
+    def __init__(self, phase: str, result: CodexResult) -> None:
+        self.phase = phase
+        self.result = result
+        super().__init__(f"codex exec failed during {phase} with exit code {result.returncode}")
+
+
+class LimitReached(RuntimeError):
+    pass
+
+
+class AuditLogger:
+    def __init__(
+        self,
+        enabled: bool,
+        cwd: Path,
+        implementer_thread_id: str,
+        implementer_model: ModelSpec,
+        reviewer_model: ModelSpec,
+    ) -> None:
+        self.enabled = enabled
+        self.cwd = str(cwd)
+        self.implementer_thread_id = implementer_thread_id
+        self.implementer_model = implementer_model
+        self.reviewer_model = reviewer_model
+        self.path: Path | None = None
+        self._file = None
+        self._failure_warned = False
+
+        if not enabled:
+            return
+
+        try:
+            audit_dir = self._select_audit_dir()
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.path = audit_dir / f"codex-super-review-{timestamp}-{os.getpid()}.jsonl"
+            self._file = self.path.open("a", encoding="utf-8")
+        except OSError as exc:
+            self.enabled = False
+            self.path = None
+            self._file = None
+            print(f"warning: audit logging disabled: {exc}", file=sys.stderr)
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def log(
+        self,
+        event: str,
+        *,
+        review_round: int | None = None,
+        fix_round: int | None = None,
+        reviewer_thread_id: str | None = None,
+        prompt: str | None = None,
+        response: str | None = None,
+        result: CodexResult | None = None,
+        message: str | None = None,
+    ) -> None:
+        if not self.enabled or self._file is None:
+            return
+
+        record: dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "cwd": self.cwd,
+            "implementer_thread_id": self.implementer_thread_id,
+            "implementer_model": self.implementer_model.model,
+            "implementer_reasoning_effort": self.implementer_model.reasoning_effort,
+            "reviewer_model": self.reviewer_model.model,
+            "reviewer_reasoning_effort": self.reviewer_model.reasoning_effort,
+            "review_round": review_round,
+            "fix_round": fix_round,
+            "reviewer_thread_id": reviewer_thread_id,
+            "prompt": prompt,
+            "response": response,
+            "codex_exit_code": result.returncode if result is not None else None,
+            "usage": result.usage if result is not None else None,
+            "event_types": result.event_types if result is not None else None,
+            "codex_errors": result.errors if result is not None else None,
+            "diagnostics": result.diagnostics[-20:] if result is not None else None,
+            "message": message,
+        }
+        try:
+            self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._file.flush()
+        except OSError as exc:
+            self._disable_after_failure(exc)
+
+    def _disable_after_failure(self, exc: OSError) -> None:
+        self.enabled = False
+        if not self._failure_warned:
+            print(f"warning: audit logging disabled after write failure: {exc}", file=sys.stderr)
+            self._failure_warned = True
+        self.close()
+
+    @staticmethod
+    def _select_audit_dir() -> Path:
+        system_dir = Path("/var/log/codex-super-review")
+        if system_dir.is_dir() and os.access(system_dir, os.W_OK):
+            return system_dir
+
+        xdg_state_home = os.environ.get("XDG_STATE_HOME")
+        if xdg_state_home:
+            return Path(xdg_state_home) / "codex-super-review" / "audit"
+
+        return Path.home() / ".local" / "state" / "codex-super-review" / "audit"
+
+
+class CodexExecRunner:
+    def __init__(self, codex_bin: str, cwd: Path) -> None:
+        self.codex_bin = codex_bin
+        self.cwd = cwd
+
+    def run(
+        self,
+        prompt: str,
+        *,
+        sandbox: str,
+        phase: str,
+        model_spec: ModelSpec,
+        resume_thread_id: str | None = None,
+        approval_never: bool = False,
+    ) -> CodexResult:
+        with tempfile.NamedTemporaryFile(prefix="codex-super-review-", suffix=".txt", delete=False) as tmp:
+            last_message_path = Path(tmp.name)
+
+        command = [
+            self.codex_bin,
+            "exec",
+            "--json",
+            "--model",
+            model_spec.model,
+            "--config",
+            f'model_reasoning_effort="{model_spec.reasoning_effort}"',
+            "--sandbox",
+            sandbox,
+            "--cd",
+            str(self.cwd),
+            "--output-last-message",
+            str(last_message_path),
+        ]
+        if approval_never:
+            command.extend(["--config", 'approval_policy="never"'])
+        if resume_thread_id is not None:
+            command.extend(["resume", resume_thread_id])
+
+        thread_id = resume_thread_id
+        usage: dict[str, Any] | None = None
+        event_types: list[str] = []
+        errors: list[str] = []
+        diagnostics: list[str] = []
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(self.cwd),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError as exc:
+            self._remove_temp_file(last_message_path)
+            raise CodexExecutableNotFound(f"could not find Codex executable: {self.codex_bin}") from exc
+
+        stdin_errors: list[str] = []
+
+        def write_prompt() -> None:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(prompt)
+            except BrokenPipeError:
+                stdin_errors.append("codex process closed stdin before reading the full prompt")
+            except OSError as exc:
+                stdin_errors.append(f"failed to write prompt to codex stdin: {exc}")
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+
+        writer = threading.Thread(target=write_prompt, name="codex-stdin-writer")
+        writer.start()
+
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            line = raw_line.rstrip("\n")
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                diagnostics.append(line)
+                print(f"[{phase}] {line}", file=sys.stderr)
+                continue
+
+            event_type = event.get("type")
+            if isinstance(event_type, str):
+                event_types.append(event_type)
+
+            if event_type == "thread.started" and isinstance(event.get("thread_id"), str):
+                thread_id = event["thread_id"]
+            elif event_type == "turn.completed" and isinstance(event.get("usage"), dict):
+                usage = event["usage"]
+            elif event_type == "turn.failed":
+                errors.append(_stringify_error(event.get("error")))
+            elif event_type == "error":
+                errors.append(str(event.get("message", event)))
+
+        writer.join()
+        returncode = process.wait()
+        diagnostics.extend(stdin_errors)
+        response = ""
+        try:
+            response = last_message_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            diagnostics.append(f"last message file was not written: {last_message_path}")
+        finally:
+            self._remove_temp_file(last_message_path)
+
+        return CodexResult(
+            command=command,
+            returncode=returncode,
+            response=response,
+            thread_id=thread_id,
+            usage=usage,
+            event_types=event_types,
+            errors=errors,
+            diagnostics=diagnostics,
+        )
+
+    @staticmethod
+    def _remove_temp_file(path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+class CodexReviewer:
+    def __init__(self, runner: CodexExecRunner, model_spec: ModelSpec) -> None:
+        self.runner = runner
+        self.model_spec = model_spec
+        self.thread_id: str | None = None
+
+    def review(self, prompt: str) -> CodexResult:
+        result = self.runner.run(
+            prompt,
+            sandbox="read-only",
+            phase="reviewer",
+            model_spec=self.model_spec,
+            approval_never=True,
+        )
+        if result.thread_id is not None:
+            self.thread_id = result.thread_id
+        return result
+
+    def reverify(self, prompt: str) -> CodexResult:
+        if self.thread_id is None:
+            raise RuntimeError("cannot reverify before starting reviewer thread")
+        result = self.runner.run(
+            prompt,
+            sandbox="read-only",
+            phase="reviewer-reverify",
+            model_spec=self.model_spec,
+            resume_thread_id=self.thread_id,
+            approval_never=True,
+        )
+        return result
+
+
+class CodexImplementer:
+    def __init__(self, runner: CodexExecRunner, thread_id: str, model_spec: ModelSpec) -> None:
+        self.runner = runner
+        self.thread_id = thread_id
+        self.model_spec = model_spec
+
+    def fix(self, prompt: str) -> CodexResult:
+        result = self.runner.run(
+            prompt,
+            sandbox="workspace-write",
+            phase="implementer",
+            model_spec=self.model_spec,
+            resume_thread_id=self.thread_id,
+        )
+        return result
+
+
+def orchestrate(args: argparse.Namespace) -> int:
+    cwd = Path.cwd()
+    runner = CodexExecRunner(args.codex_bin, cwd)
+    implementer_model = parse_model_spec(args.implementer_model)
+    reviewer_model = parse_model_spec(args.reviewer_model)
+    implementer = CodexImplementer(runner, args.implementer_codex_session_id, implementer_model)
+    audit = AuditLogger(
+        args.write_audit_log,
+        cwd,
+        args.implementer_codex_session_id,
+        implementer_model,
+        reviewer_model,
+    )
+
+    try:
+        if audit.path is not None:
+            print(f"Audit log: {audit.path}", file=sys.stderr)
+        print(f"Implementer model: {implementer_model.display}", file=sys.stderr)
+        print(f"Reviewer model: {reviewer_model.display}", file=sys.stderr)
+
+        outer_round = 0
+        while _has_round_remaining(outer_round, args.max_new_reviewer_streams):
+            outer_round += 1
+            print(f"Starting reviewer stream {outer_round}", file=sys.stderr)
+
+            reviewer = CodexReviewer(runner, reviewer_model)
+            review_result = reviewer.review(PROMPT_REVIEW_CHANGES)
+            audit.log(
+                "review",
+                review_round=outer_round,
+                reviewer_thread_id=reviewer.thread_id,
+                prompt=PROMPT_REVIEW_CHANGES,
+                response=review_result.response,
+                result=review_result,
+            )
+            ensure_success("reviewer initial review", review_result)
+            if reviewer.thread_id is None:
+                raise RuntimeError("reviewer did not emit a thread id")
+
+            if no_findings(review_result.response):
+                audit.log(
+                    "complete",
+                    review_round=outer_round,
+                    reviewer_thread_id=reviewer.thread_id,
+                    message="fresh reviewer found no findings",
+                )
+                print("Complete: fresh reviewer returned NO_FINDINGS", file=sys.stderr)
+                return 0
+
+            fix_round = 0
+            current_prompt = PROMPT_VALIDATE_FIX_COMMENTS
+            current_comments = review_result.response
+
+            while _has_round_remaining(fix_round, args.max_fix_rounds_per_reviewer):
+                fix_round += 1
+                print(f"Reviewer {outer_round}, fix round {fix_round}: sending findings to implementer", file=sys.stderr)
+
+                implementer_prompt = f"{current_prompt}\n\n{current_comments}"
+                fix_result = implementer.fix(implementer_prompt)
+                audit.log(
+                    "implementer_fix",
+                    review_round=outer_round,
+                    fix_round=fix_round,
+                    reviewer_thread_id=reviewer.thread_id,
+                    prompt=implementer_prompt,
+                    response=fix_result.response,
+                    result=fix_result,
+                )
+                ensure_success("implementer fix", fix_result)
+
+                reverify_prompt = build_reverify_prompt(fix_result.response)
+                reverify_result = reviewer.reverify(reverify_prompt)
+                audit.log(
+                    "reviewer_reverify",
+                    review_round=outer_round,
+                    fix_round=fix_round,
+                    reviewer_thread_id=reviewer.thread_id,
+                    prompt=reverify_prompt,
+                    response=reverify_result.response,
+                    result=reverify_result,
+                )
+                ensure_success("reviewer reverification", reverify_result)
+
+                if no_findings(reverify_result.response):
+                    audit.log(
+                        "reviewer_satisfied",
+                        review_round=outer_round,
+                        fix_round=fix_round,
+                        reviewer_thread_id=reviewer.thread_id,
+                        message="reviewer stream satisfied",
+                    )
+                    print(f"Reviewer stream {outer_round} satisfied", file=sys.stderr)
+                    break
+
+                current_prompt = PROMPT_VALIDATE_FOLLOWUP_COMMENTS
+                current_comments = reverify_result.response
+            else:
+                raise LimitReached(
+                    f"max fix rounds per reviewer reached for reviewer stream {outer_round}"
+                )
+
+        raise LimitReached("max new reviewer streams reached before convergence")
+    finally:
+        audit.close()
+
+
+def build_reverify_prompt(developer_response: str) -> str:
+    return (
+        "The developer's response to your comments can be found below.\n\n"
+        "<developer_response>\n"
+        f"{developer_response}\n"
+        "</developer_response>\n\n"
+        f"{PROMPT_REVERIFY_FIXES}"
+    )
+
+
+def no_findings(response: str) -> bool:
+    return response.strip() == NO_FINDINGS
+
+
+def _has_round_remaining(completed_rounds: int, max_rounds: int | None) -> bool:
+    return max_rounds is None or completed_rounds < max_rounds
+
+
+def ensure_success(phase: str, result: CodexResult) -> None:
+    if result.returncode != 0:
+        raise CodexRunFailure(phase, result)
+
+
+def _stringify_error(value: Any) -> str:
+    if isinstance(value, dict) and "message" in value:
+        return str(value["message"])
+    return str(value)
+
+
+def parse_positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("must be true or false")
+
+
+def parse_model_spec(value: str) -> ModelSpec:
+    raw = value.strip()
+    if not raw:
+        raise ValueError("model spec cannot be empty")
+
+    if ":" in raw:
+        model_part, effort_part = raw.rsplit(":", 1)
+    else:
+        parts = raw.split()
+        if len(parts) < 2:
+            raise ValueError(
+                "model spec must include a model and reasoning effort, for example: gpt-5.4 xhigh"
+            )
+        model_part = " ".join(parts[:-1])
+        effort_part = parts[-1]
+
+    reasoning_effort = effort_part.strip().lower()
+    if reasoning_effort not in REASONING_EFFORTS:
+        allowed = ", ".join(sorted(REASONING_EFFORTS))
+        raise ValueError(f"unsupported reasoning effort {effort_part!r}; expected one of: {allowed}")
+
+    model = normalize_model_name(model_part.strip())
+    if not model:
+        raise ValueError("model name cannot be empty")
+
+    return ModelSpec(raw=raw, model=model, reasoning_effort=reasoning_effort)
+
+
+def normalize_model_name(value: str) -> str:
+    return "-".join(value.split())
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-super-review",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Run iterative Codex reviewer streams against a persistent implementer Codex session.",
+        epilog="""Examples:
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-new-reviewer-streams 3
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-fix-rounds-per-reviewer 2
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log false
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer-model "gpt 5.5 medium" --reviewer-model "gpt 5.4 xhigh"
+
+The command must be run from the project root to review. The provided implementer
+session must be resumable by `codex exec resume`, and this harness should be the
+only active controller of that session while it runs.
+
+Model arguments are formatted as "<model> <reasoning_effort>" or
+"<model>:<reasoning_effort>". Spaces inside the model name are normalized to
+hyphens, so "gpt 5.4 xhigh" becomes --model gpt-5.4 with
+model_reasoning_effort="xhigh".""",
+    )
+    parser.add_argument(
+        "implementer_codex_session_id",
+        help="Existing Codex session/thread id for the persistent implementer stream.",
+    )
+    parser.add_argument(
+        "--max-new-reviewer-streams",
+        type=parse_positive_int,
+        default=None,
+        metavar="N",
+        help="Maximum fresh reviewer streams to create. Default: infinite.",
+    )
+    parser.add_argument(
+        "--max-fix-rounds-per-reviewer",
+        type=parse_positive_int,
+        default=None,
+        metavar="N",
+        help="Maximum fix/reverify rounds inside each reviewer stream. Default: infinite.",
+    )
+    parser.add_argument(
+        "--write-audit-log",
+        type=parse_bool,
+        default=True,
+        metavar="true|false",
+        help="Write JSONL audit logs. Default: true.",
+    )
+    parser.add_argument(
+        "--implementer-model",
+        default=DEFAULT_IMPLEMENTER_MODEL,
+        metavar="MODEL EFFORT",
+        help=f'Implementer model and reasoning effort. Default: "{DEFAULT_IMPLEMENTER_MODEL}".',
+    )
+    parser.add_argument(
+        "--reviewer-model",
+        default=DEFAULT_REVIEWER_MODEL,
+        metavar="MODEL EFFORT",
+        help=f'Reviewer model and reasoning effort. Default: "{DEFAULT_REVIEWER_MODEL}".',
+    )
+    parser.add_argument(
+        "--codex-bin",
+        default=os.environ.get("CODEX_SUPER_REVIEW_CODEX_BIN", "codex"),
+        help=argparse.SUPPRESS,
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if shutil.which(args.codex_bin) is None and Path(args.codex_bin).name == args.codex_bin:
+        print(f"error: could not find Codex executable on PATH: {args.codex_bin}", file=sys.stderr)
+        return 127
+
+    try:
+        return orchestrate(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("Interrupted", file=sys.stderr)
+        return 130
+    except CodexExecutableNotFound as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 127
+    except CodexRunFailure as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        _print_failure_details(exc.result)
+        return exc.result.returncode or 1
+    except LimitReached as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _print_failure_details(result: CodexResult) -> None:
+    if result.errors:
+        print("Codex errors:", file=sys.stderr)
+        for error in result.errors:
+            print(f"  {error}", file=sys.stderr)
+    if result.diagnostics:
+        print("Diagnostics:", file=sys.stderr)
+        for line in result.diagnostics[-20:]:
+            print(f"  {line}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
