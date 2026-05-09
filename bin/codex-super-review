@@ -565,7 +565,7 @@ def build_parser() -> argparse.ArgumentParser:
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-new-reviewer-streams 3
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-fix-rounds-per-reviewer 2
-  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log false
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log true
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer-model "gpt 5.5 medium" --reviewer-model "gpt 5.4 xhigh"
 
 The command must be run from the project root to review. The provided implementer
@@ -598,9 +598,9 @@ model_reasoning_effort="xhigh".""",
     parser.add_argument(
         "--write-audit-log",
         type=parse_bool,
-        default=True,
+        default=False,
         metavar="true|false",
-        help="Write JSONL audit logs. Default: true.",
+        help="Write JSONL audit logs containing prompts, responses, diagnostics, and usage. Default: false.",
     )
     parser.add_argument(
         "--implementer-model",
