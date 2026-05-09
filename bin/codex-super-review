@@ -19,6 +19,7 @@ from typing import Any
 
 DEFAULT_IMPLEMENTER_MODEL = "gpt-5.5 medium"
 DEFAULT_REVIEWER_MODEL = "gpt-5.4 xhigh"
+IMPLEMENTER_APPROVALS_REVIEWER = "auto_review"
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
 PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.
@@ -196,6 +197,7 @@ class CodexExecRunner:
         model_spec: ModelSpec,
         resume_thread_id: str | None = None,
         approval_never: bool = False,
+        approvals_reviewer: str | None = None,
     ) -> CodexResult:
         with tempfile.NamedTemporaryFile(prefix="codex-super-review-", suffix=".txt", delete=False) as tmp:
             last_message_path = Path(tmp.name)
@@ -217,6 +219,8 @@ class CodexExecRunner:
         ]
         if approval_never:
             command.extend(["--config", 'approval_policy="never"'])
+        if approvals_reviewer is not None:
+            command.extend(["--config", f'approvals_reviewer="{approvals_reviewer}"'])
         if resume_thread_id is not None:
             command.extend(["resume", resume_thread_id])
 
@@ -360,6 +364,7 @@ class CodexImplementer:
             phase="implementer",
             model_spec=self.model_spec,
             resume_thread_id=self.thread_id,
+            approvals_reviewer=IMPLEMENTER_APPROVALS_REVIEWER,
         )
         return result
 
@@ -382,6 +387,7 @@ def orchestrate(args: argparse.Namespace) -> int:
         if audit.path is not None:
             print(f"Audit log: {audit.path}", file=sys.stderr)
         print(f"Implementer model: {implementer_model.display}", file=sys.stderr)
+        print(f"Implementer approvals reviewer: {IMPLEMENTER_APPROVALS_REVIEWER}", file=sys.stderr)
         print(f"Reviewer model: {reviewer_model.display}", file=sys.stderr)
 
         outer_round = 0
