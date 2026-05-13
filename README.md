@@ -61,16 +61,19 @@ tool is running.
 
 ## Audit Logs
 
-Audit logging is disabled by default because logs can contain prompts,
-reviewer findings, implementer responses, diagnostics, usage metadata, working
-directory paths, and Codex thread IDs. Enable it only when you have a place to
-store that data safely:
+Audit logs are written by default:
 
 ```bash
-codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log true
+codex-super-review IMPLEMENTER_CODEX_SESSION_ID
 ```
 
-When enabled, logs are written to the first available location:
+Disable them explicitly if needed:
+
+```bash
+codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log false
+```
+
+Logs are written to the first available location:
 
 1. `/var/log/codex-super-review`, if it exists and is writable.
 2. `$XDG_STATE_HOME/codex-super-review/audit`, if `XDG_STATE_HOME` is set.

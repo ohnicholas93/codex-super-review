@@ -21,6 +21,7 @@ DEFAULT_IMPLEMENTER_MODEL = "gpt-5.5 low"
 DEFAULT_REVIEWER_MODEL = "gpt-5.4 high"
 IMPLEMENTER_APPROVALS_REVIEWER = "auto_review"
 IMPLEMENTER_APPROVAL_POLICY = "on-request"
+MAX_REVIEWER_TOOL_RETRIES = 2
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
 PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.
@@ -88,6 +89,26 @@ class CodexRunFailure(RuntimeError):
 
 class LimitReached(RuntimeError):
     pass
+
+
+class CodexResultDiagnostics(RuntimeError):
+    def __init__(self, phase: str, result: CodexResult) -> None:
+        self.phase = phase
+        self.result = result
+        super().__init__(f"codex exec reported tool or router errors during {phase}")
+
+
+@dataclass
+class RoundDiagnostics:
+    phase: str
+    review_round: int
+    fix_round: int | None
+    errors: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+
+    @property
+    def is_clean(self) -> bool:
+        return not self.errors and not self.diagnostics
 
 
 class AuditLogger:
@@ -380,6 +401,161 @@ class CodexImplementer:
         return result
 
 
+def _collect_problem_lines(result: CodexResult) -> tuple[list[str], list[str]]:
+    diagnostic_lines = [
+        line for line in result.diagnostics if "ERROR " in line or "error=" in line.lower()
+    ]
+    return result.errors.copy(), diagnostic_lines
+
+
+def _round_diagnostics_summary(entry: RoundDiagnostics) -> str:
+    parts = [f"{entry.phase}"]
+    parts.append(f"reviewer stream {entry.review_round}")
+    if entry.fix_round is not None:
+        parts.append(f"fix round {entry.fix_round}")
+    parts.append(f"errors={len(entry.errors)}")
+    parts.append(f"diagnostics={len(entry.diagnostics)}")
+    return ", ".join(parts)
+
+
+def _print_round_diagnostics(entries: list[RoundDiagnostics]) -> None:
+    if not entries:
+        return
+    print("Round diagnostics:", file=sys.stderr)
+    for entry in entries:
+        print(f"  {_round_diagnostics_summary(entry)}", file=sys.stderr)
+        for error in entry.errors[-3:]:
+            print(f"    error: {error}", file=sys.stderr)
+        for line in entry.diagnostics[-3:]:
+            print(f"    diagnostic: {line}", file=sys.stderr)
+
+
+def _raise_for_result_problems(
+    phase: str,
+    result: CodexResult,
+    *,
+    allow_diagnostics: bool,
+) -> None:
+    errors, diagnostics = _collect_problem_lines(result)
+    if errors or (diagnostics and not allow_diagnostics):
+        raise CodexResultDiagnostics(phase, result)
+
+
+def _run_reviewer_review_with_retries(
+    runner: CodexExecRunner,
+    reviewer_model: ModelSpec,
+    prompt: str,
+    *,
+    review_round: int,
+    audit: AuditLogger,
+) -> tuple[CodexReviewer, CodexResult]:
+    attempt = 0
+    while True:
+        reviewer = CodexReviewer(runner, reviewer_model)
+        result = reviewer.review(prompt)
+        audit.log(
+            "review",
+            review_round=review_round,
+            reviewer_thread_id=reviewer.thread_id,
+            prompt=prompt,
+            response=result.response,
+            result=result,
+        )
+        try:
+            ensure_success("reviewer initial review", result)
+            _raise_for_result_problems("reviewer initial review", result, allow_diagnostics=False)
+            if reviewer.thread_id is None:
+                raise RuntimeError("reviewer did not emit a thread id")
+            return reviewer, result
+        except (CodexRunFailure, CodexResultDiagnostics) as exc:
+            if attempt >= MAX_REVIEWER_TOOL_RETRIES:
+                raise exc
+            attempt += 1
+            print(
+                f"Reviewer stream {review_round} hit a transient failure during initial review; retrying with a fresh reviewer ({attempt}/{MAX_REVIEWER_TOOL_RETRIES})",
+                file=sys.stderr,
+            )
+            audit.log(
+                "reviewer_retryable_failure",
+                review_round=review_round,
+                reviewer_thread_id=reviewer.thread_id,
+                prompt=prompt,
+                response=result.response,
+                result=result,
+                message=f"initial review retry {attempt} of {MAX_REVIEWER_TOOL_RETRIES}",
+            )
+
+
+def _run_reviewer_reverify_with_retries(
+    runner: CodexExecRunner,
+    reviewer: CodexReviewer,
+    reviewer_model: ModelSpec,
+    prompt: str,
+    reviewer_comments: str,
+    developer_response: str,
+    *,
+    review_round: int,
+    fix_round: int,
+    audit: AuditLogger,
+    round_diagnostics: list[RoundDiagnostics],
+) -> tuple[CodexReviewer, CodexResult]:
+    attempt = 0
+    current_reviewer = reviewer
+    while True:
+        if attempt > 0:
+            current_reviewer = CodexReviewer(runner, reviewer_model)
+            retry_prompt = build_reverify_retry_prompt(reviewer_comments, developer_response)
+            result = current_reviewer.review(retry_prompt)
+        else:
+            retry_prompt = prompt
+            result = current_reviewer.reverify(prompt)
+        reverify_errors, reverify_diagnostics = _collect_problem_lines(result)
+        if reverify_errors or reverify_diagnostics:
+            round_diagnostics.append(
+                RoundDiagnostics(
+                    phase="reviewer-reverify",
+                    review_round=review_round,
+                    fix_round=fix_round,
+                    errors=reverify_errors,
+                    diagnostics=reverify_diagnostics,
+                )
+            )
+        audit.log(
+            "reviewer_reverify",
+            review_round=review_round,
+            fix_round=fix_round,
+            reviewer_thread_id=current_reviewer.thread_id,
+            prompt=retry_prompt,
+            response=result.response,
+            result=result,
+        )
+        try:
+            ensure_success("reviewer reverification", result)
+            _raise_for_result_problems("reviewer reverification", result, allow_diagnostics=False)
+            if current_reviewer.thread_id is None:
+                raise RuntimeError("reviewer did not emit a thread id")
+            return current_reviewer, result
+        except (CodexRunFailure, CodexResultDiagnostics) as exc:
+            if attempt >= MAX_REVIEWER_TOOL_RETRIES:
+                raise exc
+            attempt += 1
+            print(
+                f"Reviewer stream {review_round} hit a transient failure during reverification; retrying with a fresh reviewer ({attempt}/{MAX_REVIEWER_TOOL_RETRIES})",
+                file=sys.stderr,
+            )
+            audit.log(
+                "reviewer_retryable_failure",
+                review_round=review_round,
+                fix_round=fix_round,
+                reviewer_thread_id=current_reviewer.thread_id,
+                prompt=retry_prompt,
+                response=result.response,
+                result=result,
+                message=f"reverification retry {attempt} of {MAX_REVIEWER_TOOL_RETRIES}",
+            )
+            current_reviewer = CodexReviewer(runner, reviewer_model)
+
+
 def orchestrate(args: argparse.Namespace) -> int:
     cwd = Path.cwd()
     runner = CodexExecRunner(args.codex_bin, cwd)
@@ -393,33 +569,28 @@ def orchestrate(args: argparse.Namespace) -> int:
         implementer_model,
         reviewer_model,
     )
+    round_diagnostics: list[RoundDiagnostics] = []
 
     try:
         if audit.path is not None:
             print(f"Audit log: {audit.path}", file=sys.stderr)
-        print(f"Implementer model: {implementer_model.display}", file=sys.stderr)
+        print(f"Requested implementer model: {implementer_model.display}", file=sys.stderr)
         print(f"Implementer approval policy: {IMPLEMENTER_APPROVAL_POLICY}", file=sys.stderr)
         print(f"Implementer approvals reviewer: {IMPLEMENTER_APPROVALS_REVIEWER}", file=sys.stderr)
-        print(f"Reviewer model: {reviewer_model.display}", file=sys.stderr)
+        print(f"Requested reviewer model: {reviewer_model.display}", file=sys.stderr)
 
         outer_round = 0
         while _has_round_remaining(outer_round, args.max_new_reviewer_streams):
             outer_round += 1
             print(f"Starting reviewer stream {outer_round}", file=sys.stderr)
 
-            reviewer = CodexReviewer(runner, reviewer_model)
-            review_result = reviewer.review(PROMPT_REVIEW_CHANGES)
-            audit.log(
-                "review",
+            reviewer, review_result = _run_reviewer_review_with_retries(
+                runner,
+                reviewer_model,
+                PROMPT_REVIEW_CHANGES,
                 review_round=outer_round,
-                reviewer_thread_id=reviewer.thread_id,
-                prompt=PROMPT_REVIEW_CHANGES,
-                response=review_result.response,
-                result=review_result,
+                audit=audit,
             )
-            ensure_success("reviewer initial review", review_result)
-            if reviewer.thread_id is None:
-                raise RuntimeError("reviewer did not emit a thread id")
 
             if no_findings(review_result.response):
                 audit.log(
@@ -441,6 +612,17 @@ def orchestrate(args: argparse.Namespace) -> int:
 
                 implementer_prompt = f"{current_prompt}\n\n{current_comments}"
                 fix_result = implementer.fix(implementer_prompt)
+                fix_errors, fix_diagnostics = _collect_problem_lines(fix_result)
+                if fix_errors or fix_diagnostics:
+                    round_diagnostics.append(
+                        RoundDiagnostics(
+                            phase="implementer",
+                            review_round=outer_round,
+                            fix_round=fix_round,
+                            errors=fix_errors,
+                            diagnostics=fix_diagnostics,
+                        )
+                    )
                 audit.log(
                     "implementer_fix",
                     review_round=outer_round,
@@ -453,17 +635,18 @@ def orchestrate(args: argparse.Namespace) -> int:
                 ensure_success("implementer fix", fix_result)
 
                 reverify_prompt = build_reverify_prompt(fix_result.response)
-                reverify_result = reviewer.reverify(reverify_prompt)
-                audit.log(
-                    "reviewer_reverify",
+                reviewer, reverify_result = _run_reviewer_reverify_with_retries(
+                    runner,
+                    reviewer,
+                    reviewer_model,
+                    reverify_prompt,
+                    current_comments,
+                    fix_result.response,
                     review_round=outer_round,
                     fix_round=fix_round,
-                    reviewer_thread_id=reviewer.thread_id,
-                    prompt=reverify_prompt,
-                    response=reverify_result.response,
-                    result=reverify_result,
+                    audit=audit,
+                    round_diagnostics=round_diagnostics,
                 )
-                ensure_success("reviewer reverification", reverify_result)
 
                 if no_findings(reverify_result.response):
                     audit.log(
@@ -474,6 +657,13 @@ def orchestrate(args: argparse.Namespace) -> int:
                         message="reviewer stream satisfied",
                     )
                     print(f"Reviewer stream {outer_round} satisfied", file=sys.stderr)
+                    _print_round_diagnostics(
+                        [
+                            entry
+                            for entry in round_diagnostics
+                            if entry.review_round == outer_round
+                        ]
+                    )
                     break
 
                 current_prompt = PROMPT_VALIDATE_FOLLOWUP_COMMENTS
@@ -491,6 +681,22 @@ def orchestrate(args: argparse.Namespace) -> int:
 def build_reverify_prompt(developer_response: str) -> str:
     return (
         "The developer's response to your comments can be found below.\n\n"
+        "<developer_response>\n"
+        f"{developer_response}\n"
+        "</developer_response>\n\n"
+        f"{PROMPT_REVERIFY_FIXES}"
+    )
+
+
+def build_reverify_retry_prompt(reviewer_comments: str, developer_response: str) -> str:
+    return (
+        "A previous reviewer stream hit a transient tool or router failure during reverification. "
+        "You are a fresh reviewer. Re-evaluate the current code changes using the reviewer comments "
+        "and the developer response below. Determine whether those concerns are fully resolved and whether "
+        "any other actionable issues remain.\n\n"
+        "<reviewer_comments>\n"
+        f"{reviewer_comments}\n"
+        "</reviewer_comments>\n\n"
         "<developer_response>\n"
         f"{developer_response}\n"
         "</developer_response>\n\n"
@@ -610,9 +816,9 @@ model_reasoning_effort="xhigh".""",
     parser.add_argument(
         "--write-audit-log",
         type=parse_bool,
-        default=False,
+        default=True,
         metavar="true|false",
-        help="Write JSONL audit logs containing prompts, responses, diagnostics, and usage. Default: false.",
+        help="Write JSONL audit logs containing prompts, responses, diagnostics, and usage. Default: true.",
     )
     parser.add_argument(
         "--implementer-model",
@@ -657,6 +863,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         _print_failure_details(exc.result)
         return exc.result.returncode or 1
+    except CodexResultDiagnostics as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        _print_failure_details(exc.result)
+        return 1
     except LimitReached as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

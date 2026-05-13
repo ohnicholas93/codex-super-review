@@ -15,15 +15,15 @@ Useful reports include:
 - Affected commit or release.
 - The command and options used.
 - Expected and observed behavior.
-- Whether audit logging was enabled.
+- Whether audit logging was disabled.
 - Minimal reproduction details that do not include secrets.
 
 ## Sensitive Data Handling
 
 `codex-super-review` can process proprietary source code and model output.
-Audit logs are disabled by default because they can include prompts, reviewer
-findings, implementer responses, diagnostics, usage metadata, working directory
-paths, and Codex thread IDs.
+Audit logs are written by default and can include prompts, reviewer findings,
+implementer responses, diagnostics, usage metadata, working directory paths,
+and Codex thread IDs. Disable them explicitly when needed.
 
 Before sharing logs or terminal output, review them for:
 
