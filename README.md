@@ -80,8 +80,11 @@ When enabled, logs are written to the first available location:
 
 - Reviewer streams run with Codex read-only sandboxing and
   `approval_policy="never"`.
-- Implementer fix rounds run with workspace-write sandboxing and Codex
-  `approvals_reviewer="auto_review"`.
+- Implementer fix rounds run with workspace-write sandboxing, Codex
+  `approval_policy="on-request"`, and `approvals_reviewer="auto_review"`.
+  This lets the implementer request an auto-reviewed escalation for Git-index
+  operations, such as staging files, when `.git` is not writable inside the
+  sandbox.
 - The tool invokes Codex through `subprocess.Popen` with an argument list, not
   through a shell command string.
 - Do not commit `private/`, `.codex/`, local `codex` checkouts, `.env` files,

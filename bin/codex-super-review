@@ -17,9 +17,10 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_IMPLEMENTER_MODEL = "gpt-5.5 medium"
-DEFAULT_REVIEWER_MODEL = "gpt-5.4 xhigh"
+DEFAULT_IMPLEMENTER_MODEL = "gpt-5.5 low"
+DEFAULT_REVIEWER_MODEL = "gpt-5.4 high"
 IMPLEMENTER_APPROVALS_REVIEWER = "auto_review"
+IMPLEMENTER_APPROVAL_POLICY = "on-request"
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
 PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.
@@ -30,7 +31,9 @@ NO_FINDINGS
 
 If you do find issues, do not include the string NO_FINDINGS anywhere in your response."""
 
-PROMPT_VALIDATE_FIX_COMMENTS = """Another developer wrote these comments regarding your changes (currently uncommitted in git). Please verify and check the correctness and applicability of their findings. If their concerns are valid and appropriate, please fix and address them."""
+PROMPT_VALIDATE_FIX_COMMENTS = """Another developer wrote these comments regarding your changes (currently uncommitted in git). Please verify and check the correctness and applicability of their findings. If their concerns are valid and appropriate, please fix and address them.
+
+If some command fails due to permission issues, retry it with escalation. If harmless, an oracle will approve it."""
 
 PROMPT_REVERIFY_FIXES = """Can you recheck now if all concerns have been successfully fixed, and if any other issues persist or cropped up since?
 
@@ -38,9 +41,13 @@ If all concerns are resolved and you find no actionable issues, your final respo
 
 NO_FINDINGS
 
-If you do find issues, do not include the string NO_FINDINGS anywhere in your response."""
+If you do find issues, do not include the string NO_FINDINGS anywhere in your response.
 
-PROMPT_VALIDATE_FOLLOWUP_COMMENTS = """The reviewing developer returned with the following notes. Please verify and check the correctness and applicability of their findings. If their concerns are valid and appropriate, please fix and address them."""
+If remaining issues are not solvable by implementer, it would count as NO_FINDINGS."""
+
+PROMPT_VALIDATE_FOLLOWUP_COMMENTS = """The reviewing developer returned with the following notes. Please verify and check the correctness and applicability of their findings. If their concerns are valid and appropriate, please fix and address them.
+
+If some command fails due to permission issues, retry it with escalation. If harmless, an oracle will approve it."""
 
 NO_FINDINGS = "NO_FINDINGS"
 
@@ -197,6 +204,7 @@ class CodexExecRunner:
         model_spec: ModelSpec,
         resume_thread_id: str | None = None,
         approval_never: bool = False,
+        approval_policy: str | None = None,
         approvals_reviewer: str | None = None,
     ) -> CodexResult:
         with tempfile.NamedTemporaryFile(prefix="codex-super-review-", suffix=".txt", delete=False) as tmp:
@@ -219,6 +227,8 @@ class CodexExecRunner:
         ]
         if approval_never:
             command.extend(["--config", 'approval_policy="never"'])
+        if approval_policy is not None:
+            command.extend(["--config", f'approval_policy="{approval_policy}"'])
         if approvals_reviewer is not None:
             command.extend(["--config", f'approvals_reviewer="{approvals_reviewer}"'])
         if resume_thread_id is not None:
@@ -364,6 +374,7 @@ class CodexImplementer:
             phase="implementer",
             model_spec=self.model_spec,
             resume_thread_id=self.thread_id,
+            approval_policy=IMPLEMENTER_APPROVAL_POLICY,
             approvals_reviewer=IMPLEMENTER_APPROVALS_REVIEWER,
         )
         return result
@@ -387,6 +398,7 @@ def orchestrate(args: argparse.Namespace) -> int:
         if audit.path is not None:
             print(f"Audit log: {audit.path}", file=sys.stderr)
         print(f"Implementer model: {implementer_model.display}", file=sys.stderr)
+        print(f"Implementer approval policy: {IMPLEMENTER_APPROVAL_POLICY}", file=sys.stderr)
         print(f"Implementer approvals reviewer: {IMPLEMENTER_APPROVALS_REVIEWER}", file=sys.stderr)
         print(f"Reviewer model: {reviewer_model.display}", file=sys.stderr)
 
