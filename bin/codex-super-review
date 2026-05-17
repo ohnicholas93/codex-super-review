@@ -28,6 +28,7 @@ MAX_REVIEWER_TOOL_RETRIES = 2
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 APP_SERVER_COMPACTION_TIMEOUT_SECONDS = 900
 APP_SERVER_TOKEN_USAGE_TIMEOUT_SECONDS = 30
+CODEX_TUI_CONTEXT_BASELINE_TOKENS = 12_000
 
 PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.
 
@@ -125,6 +126,7 @@ class PreCompactResult:
     status: str
     message: str
     total_tokens: int | None = None
+    active_context_tokens: int | None = None
     context_window: int | None = None
     usage_percent: float | None = None
     compacted: bool = False
@@ -700,16 +702,23 @@ def maybe_compact_implementer_before_first_fix(
             )
 
         total = _coerce_int(_get_nested(token_usage, "total", "totalTokens"))
+        active_context = _coerce_int(_get_nested(token_usage, "last", "totalTokens"))
         context_window = _coerce_int(token_usage.get("modelContextWindow"))
-        if total is None or context_window is None or context_window <= 0:
+        if active_context is None or context_window is None or context_window <= 0:
             return PreCompactResult(
                 status="skipped_incomplete_usage",
-                message="skipped implementer pre-fix compaction: token usage did not include totalTokens and modelContextWindow",
+                message="skipped implementer pre-fix compaction: token usage did not include last.totalTokens and modelContextWindow",
                 total_tokens=total,
+                active_context_tokens=active_context,
                 context_window=context_window,
             )
 
-        usage_percent = (total / context_window) * 100
+        effective_window = context_window - CODEX_TUI_CONTEXT_BASELINE_TOKENS
+        effective_used = max(active_context - CODEX_TUI_CONTEXT_BASELINE_TOKENS, 0)
+        if effective_window <= 0:
+            usage_percent = 100.0
+        else:
+            usage_percent = min(max((effective_used / effective_window) * 100, 0.0), 100.0)
         if usage_percent < threshold_percent:
             return PreCompactResult(
                 status="skipped_below_threshold",
@@ -718,6 +727,7 @@ def maybe_compact_implementer_before_first_fix(
                     f"context usage {usage_percent:.1f}% is below {threshold_percent:.1f}%"
                 ),
                 total_tokens=total,
+                active_context_tokens=active_context,
                 context_window=context_window,
                 usage_percent=usage_percent,
             )
@@ -730,6 +740,7 @@ def maybe_compact_implementer_before_first_fix(
                 f"context usage {usage_percent:.1f}% met {threshold_percent:.1f}% threshold"
             ),
             total_tokens=total,
+            active_context_tokens=active_context,
             context_window=context_window,
             usage_percent=usage_percent,
             compacted=True,
@@ -938,6 +949,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                         extra={
                             "status": precompact_result.status,
                             "total_tokens": precompact_result.total_tokens,
+                            "active_context_tokens": precompact_result.active_context_tokens,
                             "context_window": precompact_result.context_window,
                             "usage_percent": precompact_result.usage_percent,
                             "threshold_percent": args.implementer_compact_threshold_percent,
