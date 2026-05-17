@@ -5,6 +5,11 @@ implementer Codex session. It starts fresh read-only reviewer streams, sends
 actionable findings back to the implementer session, and repeats until a fresh
 reviewer returns `NO_FINDINGS` or a configured round limit is reached.
 
+## ⚠️ Warning ⚠️
+
+> This tool can and likely will consume an enormous number of tokens,
+especially across multiple reviewer streams and fix rounds. Use at your own risk.
+
 ## Requirements
 
 - Python 3.10 or newer.
@@ -49,12 +54,12 @@ codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
 
 Before the first fix round for each fresh reviewer stream, the tool checks the
 implementer thread's restored context usage through Codex app-server. If usage is
-at or above 50%, it triggers Codex's built-in compaction before sending the
+at or above 40%, it triggers Codex's built-in compaction before sending the
 reviewer findings to the implementer:
 
 ```bash
 codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
-  --implementer-compact-threshold-percent 50
+  --implementer-compact-threshold-percent 40
 ```
 
 Use `0` to disable this pre-fix compaction check.

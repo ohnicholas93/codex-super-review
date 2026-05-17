@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_IMPLEMENTER_MODEL = "gpt-5.5 low"
 DEFAULT_REVIEWER_MODEL = "gpt-5.4 medium"
 IMPLEMENTER_APPROVALS_REVIEWER = "auto_review"
@@ -30,7 +29,7 @@ APP_SERVER_COMPACTION_TIMEOUT_SECONDS = 900
 APP_SERVER_TOKEN_USAGE_TIMEOUT_SECONDS = 30
 CODEX_TUI_CONTEXT_BASELINE_TOKENS = 12_000
 
-PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.
+PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings. Try to be comprehensive and precise so as to not require unnecessarily frequent back-and-forths with the developer.
 
 If you find no actionable issues, your final response must be exactly:
 
@@ -90,7 +89,9 @@ class CodexRunFailure(RuntimeError):
     def __init__(self, phase: str, result: CodexResult) -> None:
         self.phase = phase
         self.result = result
-        super().__init__(f"codex exec failed during {phase} with exit code {result.returncode}")
+        super().__init__(
+            f"codex exec failed during {phase} with exit code {result.returncode}"
+        )
 
 
 class LimitReached(RuntimeError):
@@ -157,7 +158,9 @@ class AuditLogger:
             audit_dir = self._select_audit_dir()
             audit_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            self.path = audit_dir / f"codex-super-review-{timestamp}-{os.getpid()}.jsonl"
+            self.path = (
+                audit_dir / f"codex-super-review-{timestamp}-{os.getpid()}.jsonl"
+            )
             self._file = self.path.open("a", encoding="utf-8")
         except OSError as exc:
             self.enabled = False
@@ -218,7 +221,10 @@ class AuditLogger:
     def _disable_after_failure(self, exc: OSError) -> None:
         self.enabled = False
         if not self._failure_warned:
-            print(f"warning: audit logging disabled after write failure: {exc}", file=sys.stderr)
+            print(
+                f"warning: audit logging disabled after write failure: {exc}",
+                file=sys.stderr,
+            )
             self._failure_warned = True
         self.close()
 
@@ -252,7 +258,9 @@ class CodexExecRunner:
         approval_policy: str | None = None,
         approvals_reviewer: str | None = None,
     ) -> CodexResult:
-        with tempfile.NamedTemporaryFile(prefix="codex-super-review-", suffix=".txt", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            prefix="codex-super-review-", suffix=".txt", delete=False
+        ) as tmp:
             last_message_path = Path(tmp.name)
 
         command = [
@@ -298,7 +306,9 @@ class CodexExecRunner:
             )
         except FileNotFoundError as exc:
             self._remove_temp_file(last_message_path)
-            raise CodexExecutableNotFound(f"could not find Codex executable: {self.codex_bin}") from exc
+            raise CodexExecutableNotFound(
+                f"could not find Codex executable: {self.codex_bin}"
+            ) from exc
 
         stdin_errors: list[str] = []
 
@@ -307,7 +317,9 @@ class CodexExecRunner:
             try:
                 process.stdin.write(prompt)
             except BrokenPipeError:
-                stdin_errors.append("codex process closed stdin before reading the full prompt")
+                stdin_errors.append(
+                    "codex process closed stdin before reading the full prompt"
+                )
             except OSError as exc:
                 stdin_errors.append(f"failed to write prompt to codex stdin: {exc}")
             finally:
@@ -335,9 +347,13 @@ class CodexExecRunner:
             if isinstance(event_type, str):
                 event_types.append(event_type)
 
-            if event_type == "thread.started" and isinstance(event.get("thread_id"), str):
+            if event_type == "thread.started" and isinstance(
+                event.get("thread_id"), str
+            ):
                 thread_id = event["thread_id"]
-            elif event_type == "turn.completed" and isinstance(event.get("usage"), dict):
+            elif event_type == "turn.completed" and isinstance(
+                event.get("usage"), dict
+            ):
                 usage = event["usage"]
             elif event_type == "turn.failed":
                 errors.append(_stringify_error(event.get("error")))
@@ -351,7 +367,9 @@ class CodexExecRunner:
         try:
             response = last_message_path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            diagnostics.append(f"last message file was not written: {last_message_path}")
+            diagnostics.append(
+                f"last message file was not written: {last_message_path}"
+            )
         finally:
             self._remove_temp_file(last_message_path)
 
@@ -405,7 +423,9 @@ class AppServerJsonRpcClient:
                 errors="replace",
             )
         except FileNotFoundError as exc:
-            raise CodexExecutableNotFound(f"could not find Codex executable: {self.codex_bin}") from exc
+            raise CodexExecutableNotFound(
+                f"could not find Codex executable: {self.codex_bin}"
+            ) from exc
 
         assert self._process.stdout is not None
         self._reader = threading.Thread(
@@ -486,7 +506,10 @@ class AppServerJsonRpcClient:
                 continue
             method = message.get("method")
             item_type = _get_nested(message, "params", "item", "type")
-            if method in {"item/started", "item/completed"} and item_type == "contextCompaction":
+            if (
+                method in {"item/started", "item/completed"}
+                and item_type == "contextCompaction"
+            ):
                 saw_compaction_item = True
                 turn_id = _get_nested(message, "params", "turnId")
                 if isinstance(turn_id, str):
@@ -501,11 +524,17 @@ class AppServerJsonRpcClient:
                 if saw_compaction_item:
                     status = turn.get("status")
                     if status != "completed":
-                        raise CodexAppServerFailure(f"compaction turn ended with status {status!r}")
+                        raise CodexAppServerFailure(
+                            f"compaction turn ended with status {status!r}"
+                        )
                     return
-        raise CodexAppServerFailure("timed out waiting for app-server compaction to complete")
+        raise CodexAppServerFailure(
+            "timed out waiting for app-server compaction to complete"
+        )
 
-    def request(self, method: str, params: dict[str, Any] | None = None, *, timeout: int = 30) -> Any:
+    def request(
+        self, method: str, params: dict[str, Any] | None = None, *, timeout: int = 30
+    ) -> Any:
         request_id = self._next_request_id
         self._next_request_id += 1
         payload: dict[str, Any] = {"id": request_id, "method": method}
@@ -515,7 +544,9 @@ class AppServerJsonRpcClient:
         deadline = time.monotonic() + timeout
         ignored_messages: list[dict[str, Any]] = []
         while time.monotonic() < deadline:
-            message = self._read_queue_message(timeout=max(0.1, deadline - time.monotonic()))
+            message = self._read_queue_message(
+                timeout=max(0.1, deadline - time.monotonic())
+            )
             if message is None:
                 break
             if message.get("id") != request_id:
@@ -525,12 +556,16 @@ class AppServerJsonRpcClient:
                 self._pending_messages.extendleft(reversed(ignored_messages))
                 error = message["error"]
                 if isinstance(error, dict):
-                    raise CodexAppServerFailure(f"{method} failed: {error.get('message', error)}")
+                    raise CodexAppServerFailure(
+                        f"{method} failed: {error.get('message', error)}"
+                    )
                 raise CodexAppServerFailure(f"{method} failed: {error}")
             self._pending_messages.extendleft(reversed(ignored_messages))
             return message.get("result")
         self._pending_messages.extendleft(reversed(ignored_messages))
-        raise CodexAppServerFailure(f"timed out waiting for app-server response to {method}")
+        raise CodexAppServerFailure(
+            f"timed out waiting for app-server response to {method}"
+        )
 
     def next_message(self, *, timeout: float) -> dict[str, Any] | None:
         if self._pending_messages:
@@ -578,7 +613,9 @@ class AppServerJsonRpcClient:
             process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
             process.stdin.flush()
         except OSError as exc:
-            raise CodexAppServerFailure(f"failed to write to app-server stdin: {exc}") from exc
+            raise CodexAppServerFailure(
+                f"failed to write to app-server stdin: {exc}"
+            ) from exc
 
     def _read_stdout(self) -> None:
         assert self._process is not None and self._process.stdout is not None
@@ -632,7 +669,9 @@ class CodexReviewer:
 
 
 class CodexImplementer:
-    def __init__(self, runner: CodexExecRunner, thread_id: str, model_spec: ModelSpec) -> None:
+    def __init__(
+        self, runner: CodexExecRunner, thread_id: str, model_spec: ModelSpec
+    ) -> None:
         self.runner = runner
         self.thread_id = thread_id
         self.model_spec = model_spec
@@ -652,7 +691,9 @@ class CodexImplementer:
 
 def _collect_problem_lines(result: CodexResult) -> tuple[list[str], list[str]]:
     diagnostic_lines = [
-        line for line in result.diagnostics if "ERROR " in line or "error=" in line.lower()
+        line
+        for line in result.diagnostics
+        if "ERROR " in line or "error=" in line.lower()
     ]
     return result.errors.copy(), diagnostic_lines
 
@@ -718,7 +759,9 @@ def maybe_compact_implementer_before_first_fix(
         if effective_window <= 0:
             usage_percent = 100.0
         else:
-            usage_percent = min(max((effective_used / effective_window) * 100, 0.0), 100.0)
+            usage_percent = min(
+                max((effective_used / effective_window) * 100, 0.0), 100.0
+            )
         if usage_percent < threshold_percent:
             return PreCompactResult(
                 status="skipped_below_threshold",
@@ -780,7 +823,9 @@ def _run_reviewer_review_with_retries(
         )
         try:
             ensure_success("reviewer initial review", result)
-            _raise_for_result_problems("reviewer initial review", result, allow_diagnostics=False)
+            _raise_for_result_problems(
+                "reviewer initial review", result, allow_diagnostics=False
+            )
             if reviewer.thread_id is None:
                 raise RuntimeError("reviewer did not emit a thread id")
             return reviewer, result
@@ -821,7 +866,9 @@ def _run_reviewer_reverify_with_retries(
     while True:
         if attempt > 0:
             current_reviewer = CodexReviewer(runner, reviewer_model)
-            retry_prompt = build_reverify_retry_prompt(reviewer_comments, developer_response)
+            retry_prompt = build_reverify_retry_prompt(
+                reviewer_comments, developer_response
+            )
             result = current_reviewer.review(retry_prompt)
         else:
             retry_prompt = prompt
@@ -848,7 +895,9 @@ def _run_reviewer_reverify_with_retries(
         )
         try:
             ensure_success("reviewer reverification", result)
-            _raise_for_result_problems("reviewer reverification", result, allow_diagnostics=False)
+            _raise_for_result_problems(
+                "reviewer reverification", result, allow_diagnostics=False
+            )
             if current_reviewer.thread_id is None:
                 raise RuntimeError("reviewer did not emit a thread id")
             return current_reviewer, result
@@ -878,7 +927,9 @@ def orchestrate(args: argparse.Namespace) -> int:
     runner = CodexExecRunner(args.codex_bin, cwd)
     implementer_model = parse_model_spec(args.implementer_model)
     reviewer_model = parse_model_spec(args.reviewer_model)
-    implementer = CodexImplementer(runner, args.implementer_codex_session_id, implementer_model)
+    implementer = CodexImplementer(
+        runner, args.implementer_codex_session_id, implementer_model
+    )
     audit = AuditLogger(
         args.write_audit_log,
         cwd,
@@ -891,9 +942,17 @@ def orchestrate(args: argparse.Namespace) -> int:
     try:
         if audit.path is not None:
             print(f"Audit log: {audit.path}", file=sys.stderr)
-        print(f"Requested implementer model: {implementer_model.display}", file=sys.stderr)
-        print(f"Implementer approval policy: {IMPLEMENTER_APPROVAL_POLICY}", file=sys.stderr)
-        print(f"Implementer approvals reviewer: {IMPLEMENTER_APPROVALS_REVIEWER}", file=sys.stderr)
+        print(
+            f"Requested implementer model: {implementer_model.display}", file=sys.stderr
+        )
+        print(
+            f"Implementer approval policy: {IMPLEMENTER_APPROVAL_POLICY}",
+            file=sys.stderr,
+        )
+        print(
+            f"Implementer approvals reviewer: {IMPLEMENTER_APPROVALS_REVIEWER}",
+            file=sys.stderr,
+        )
         print(f"Requested reviewer model: {reviewer_model.display}", file=sys.stderr)
 
         outer_round = 0
@@ -925,7 +984,10 @@ def orchestrate(args: argparse.Namespace) -> int:
 
             while _has_round_remaining(fix_round, args.max_fix_rounds_per_reviewer):
                 fix_round += 1
-                print(f"Reviewer {outer_round}, fix round {fix_round}: sending findings to implementer", file=sys.stderr)
+                print(
+                    f"Reviewer {outer_round}, fix round {fix_round}: sending findings to implementer",
+                    file=sys.stderr,
+                )
 
                 if fix_round == 1:
                     print(
@@ -1137,7 +1199,9 @@ def parse_model_spec(value: str) -> ModelSpec:
     reasoning_effort = effort_part.strip().lower()
     if reasoning_effort not in REASONING_EFFORTS:
         allowed = ", ".join(sorted(REASONING_EFFORTS))
-        raise ValueError(f"unsupported reasoning effort {effort_part!r}; expected one of: {allowed}")
+        raise ValueError(
+            f"unsupported reasoning effort {effort_part!r}; expected one of: {allowed}"
+        )
 
     model = normalize_model_name(model_part.strip())
     if not model:
@@ -1200,12 +1264,12 @@ model_reasoning_effort="xhigh".""",
     parser.add_argument(
         "--implementer-compact-threshold-percent",
         type=parse_percent,
-        default=50.0,
+        default=40.0,
         metavar="PERCENT",
         help=(
             "Before the first fix round for each fresh reviewer stream, resume the implementer "
             "through Codex app-server and compact if restored context usage is at or above this "
-            "percentage. Use 0 to disable. Default: 50."
+            "percentage. Use 0 to disable. Default: 40."
         ),
     )
     parser.add_argument(
@@ -1232,8 +1296,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if shutil.which(args.codex_bin) is None and Path(args.codex_bin).name == args.codex_bin:
-        print(f"error: could not find Codex executable on PATH: {args.codex_bin}", file=sys.stderr)
+    if (
+        shutil.which(args.codex_bin) is None
+        and Path(args.codex_bin).name == args.codex_bin
+    ):
+        print(
+            f"error: could not find Codex executable on PATH: {args.codex_bin}",
+            file=sys.stderr,
+        )
         return 127
 
     try:
