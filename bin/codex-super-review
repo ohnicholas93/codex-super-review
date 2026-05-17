@@ -6,11 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +26,8 @@ IMPLEMENTER_APPROVALS_REVIEWER = "auto_review"
 IMPLEMENTER_APPROVAL_POLICY = "on-request"
 MAX_REVIEWER_TOOL_RETRIES = 2
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+APP_SERVER_COMPACTION_TIMEOUT_SECONDS = 900
+APP_SERVER_TOKEN_USAGE_TIMEOUT_SECONDS = 30
 
 PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.
 
@@ -98,6 +103,10 @@ class CodexResultDiagnostics(RuntimeError):
         super().__init__(f"codex exec reported tool or router errors during {phase}")
 
 
+class CodexAppServerFailure(RuntimeError):
+    pass
+
+
 @dataclass
 class RoundDiagnostics:
     phase: str
@@ -109,6 +118,16 @@ class RoundDiagnostics:
     @property
     def is_clean(self) -> bool:
         return not self.errors and not self.diagnostics
+
+
+@dataclass(frozen=True)
+class PreCompactResult:
+    status: str
+    message: str
+    total_tokens: int | None = None
+    context_window: int | None = None
+    usage_percent: float | None = None
+    compacted: bool = False
 
 
 class AuditLogger:
@@ -160,6 +179,7 @@ class AuditLogger:
         response: str | None = None,
         result: CodexResult | None = None,
         message: str | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         if not self.enabled or self._file is None:
             return
@@ -185,6 +205,8 @@ class AuditLogger:
             "diagnostics": result.diagnostics[-20:] if result is not None else None,
             "message": message,
         }
+        if extra is not None:
+            record["extra"] = extra
         try:
             self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
             self._file.flush()
@@ -350,6 +372,231 @@ class CodexExecRunner:
             pass
 
 
+class AppServerJsonRpcClient:
+    def __init__(self, codex_bin: str, cwd: Path, model_spec: ModelSpec) -> None:
+        self.codex_bin = codex_bin
+        self.cwd = cwd
+        self.model_spec = model_spec
+        self._next_request_id = 1
+        self._events: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._pending_messages: deque[dict[str, Any]] = deque()
+        self._process: subprocess.Popen[str] | None = None
+        self._reader: threading.Thread | None = None
+        self._stderr_reader: threading.Thread | None = None
+
+    def __enter__(self) -> "AppServerJsonRpcClient":
+        command = [
+            self.codex_bin,
+            "app-server",
+            "--listen",
+            "stdio://",
+        ]
+        try:
+            self._process = subprocess.Popen(
+                command,
+                cwd=str(self.cwd),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError as exc:
+            raise CodexExecutableNotFound(f"could not find Codex executable: {self.codex_bin}") from exc
+
+        assert self._process.stdout is not None
+        self._reader = threading.Thread(
+            target=self._read_stdout,
+            name="codex-app-server-stdout-reader",
+            daemon=True,
+        )
+        self._reader.start()
+
+        assert self._process.stderr is not None
+        self._stderr_reader = threading.Thread(
+            target=self._drain_stderr,
+            name="codex-app-server-stderr-reader",
+            daemon=True,
+        )
+        self._stderr_reader.start()
+
+        self._initialize()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        finally:
+            self._process = None
+
+    def resume_thread_for_usage(self, thread_id: str) -> dict[str, Any] | None:
+        self.request(
+            "thread/resume",
+            {
+                "threadId": thread_id,
+                "model": self.model_spec.model,
+                "cwd": str(self.cwd),
+                "config": {"model_reasoning_effort": self.model_spec.reasoning_effort},
+            },
+            timeout=60,
+        )
+        deadline = time.monotonic() + APP_SERVER_TOKEN_USAGE_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            message = self.next_message(timeout=max(0.1, deadline - time.monotonic()))
+            if message is None:
+                break
+            if (
+                message.get("method") == "thread/tokenUsage/updated"
+                and _get_nested(message, "params", "threadId") == thread_id
+            ):
+                token_usage = _get_nested(message, "params", "tokenUsage")
+                if isinstance(token_usage, dict):
+                    return token_usage
+        return None
+
+    def compact_thread(self, thread_id: str) -> None:
+        self._clear_stale_messages()
+        self.request("thread/compact/start", {"threadId": thread_id}, timeout=60)
+        compaction_turn_id: str | None = None
+        saw_compaction_item = False
+        deadline = time.monotonic() + APP_SERVER_COMPACTION_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            message = self.next_message(timeout=max(0.1, deadline - time.monotonic()))
+            if message is None:
+                break
+            if _get_nested(message, "params", "threadId") != thread_id:
+                continue
+            method = message.get("method")
+            item_type = _get_nested(message, "params", "item", "type")
+            if method in {"item/started", "item/completed"} and item_type == "contextCompaction":
+                saw_compaction_item = True
+                turn_id = _get_nested(message, "params", "turnId")
+                if isinstance(turn_id, str):
+                    compaction_turn_id = turn_id
+            if method == "turn/completed":
+                turn = _get_nested(message, "params", "turn")
+                if not isinstance(turn, dict):
+                    continue
+                turn_id = turn.get("id")
+                if compaction_turn_id is not None and turn_id != compaction_turn_id:
+                    continue
+                if saw_compaction_item:
+                    status = turn.get("status")
+                    if status != "completed":
+                        raise CodexAppServerFailure(f"compaction turn ended with status {status!r}")
+                    return
+        raise CodexAppServerFailure("timed out waiting for app-server compaction to complete")
+
+    def request(self, method: str, params: dict[str, Any] | None = None, *, timeout: int = 30) -> Any:
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        payload: dict[str, Any] = {"id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        self._send(payload)
+        deadline = time.monotonic() + timeout
+        ignored_messages: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            message = self._read_queue_message(timeout=max(0.1, deadline - time.monotonic()))
+            if message is None:
+                break
+            if message.get("id") != request_id:
+                ignored_messages.append(message)
+                continue
+            if "error" in message:
+                self._pending_messages.extendleft(reversed(ignored_messages))
+                error = message["error"]
+                if isinstance(error, dict):
+                    raise CodexAppServerFailure(f"{method} failed: {error.get('message', error)}")
+                raise CodexAppServerFailure(f"{method} failed: {error}")
+            self._pending_messages.extendleft(reversed(ignored_messages))
+            return message.get("result")
+        self._pending_messages.extendleft(reversed(ignored_messages))
+        raise CodexAppServerFailure(f"timed out waiting for app-server response to {method}")
+
+    def next_message(self, *, timeout: float) -> dict[str, Any] | None:
+        if self._pending_messages:
+            return self._pending_messages.popleft()
+        return self._read_queue_message(timeout=timeout)
+
+    def _clear_stale_messages(self) -> None:
+        self._pending_messages.clear()
+        while True:
+            try:
+                self._events.get_nowait()
+            except queue.Empty:
+                return
+
+    def _read_queue_message(self, *, timeout: float) -> dict[str, Any] | None:
+        try:
+            return self._events.get(timeout=timeout)
+        except queue.Empty:
+            if self._process is not None and self._process.poll() is not None:
+                raise CodexAppServerFailure(
+                    f"app-server exited unexpectedly with code {self._process.returncode}"
+                )
+            return None
+
+    def _initialize(self) -> None:
+        self.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "codex_super_review",
+                    "title": "codex-super-review",
+                    "version": "0.1.0",
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+            timeout=30,
+        )
+        self._send({"method": "initialized"})
+
+    def _send(self, payload: dict[str, Any]) -> None:
+        process = self._process
+        if process is None or process.stdin is None:
+            raise CodexAppServerFailure("app-server process is not running")
+        try:
+            process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+        except OSError as exc:
+            raise CodexAppServerFailure(f"failed to write to app-server stdin: {exc}") from exc
+
+    def _read_stdout(self) -> None:
+        assert self._process is not None and self._process.stdout is not None
+        for line in self._process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(message, dict):
+                self._events.put(message)
+
+    def _drain_stderr(self) -> None:
+        assert self._process is not None and self._process.stderr is not None
+        for _line in self._process.stderr:
+            pass
+
+
 class CodexReviewer:
     def __init__(self, runner: CodexExecRunner, model_spec: ModelSpec) -> None:
         self.runner = runner
@@ -428,6 +675,65 @@ def _print_round_diagnostics(entries: list[RoundDiagnostics]) -> None:
             print(f"    error: {error}", file=sys.stderr)
         for line in entry.diagnostics[-3:]:
             print(f"    diagnostic: {line}", file=sys.stderr)
+
+
+def maybe_compact_implementer_before_first_fix(
+    *,
+    codex_bin: str,
+    cwd: Path,
+    implementer_thread_id: str,
+    implementer_model: ModelSpec,
+    threshold_percent: float,
+) -> PreCompactResult:
+    if threshold_percent <= 0:
+        return PreCompactResult(
+            status="disabled",
+            message="implementer pre-fix compaction disabled",
+        )
+
+    with AppServerJsonRpcClient(codex_bin, cwd, implementer_model) as client:
+        token_usage = client.resume_thread_for_usage(implementer_thread_id)
+        if token_usage is None:
+            return PreCompactResult(
+                status="skipped_no_usage",
+                message="skipped implementer pre-fix compaction: no restored token usage available",
+            )
+
+        total = _coerce_int(_get_nested(token_usage, "total", "totalTokens"))
+        context_window = _coerce_int(token_usage.get("modelContextWindow"))
+        if total is None or context_window is None or context_window <= 0:
+            return PreCompactResult(
+                status="skipped_incomplete_usage",
+                message="skipped implementer pre-fix compaction: token usage did not include totalTokens and modelContextWindow",
+                total_tokens=total,
+                context_window=context_window,
+            )
+
+        usage_percent = (total / context_window) * 100
+        if usage_percent < threshold_percent:
+            return PreCompactResult(
+                status="skipped_below_threshold",
+                message=(
+                    "skipped implementer pre-fix compaction: "
+                    f"context usage {usage_percent:.1f}% is below {threshold_percent:.1f}%"
+                ),
+                total_tokens=total,
+                context_window=context_window,
+                usage_percent=usage_percent,
+            )
+
+        client.compact_thread(implementer_thread_id)
+        return PreCompactResult(
+            status="compacted",
+            message=(
+                "compacted implementer before first fix: "
+                f"context usage {usage_percent:.1f}% met {threshold_percent:.1f}% threshold"
+            ),
+            total_tokens=total,
+            context_window=context_window,
+            usage_percent=usage_percent,
+            compacted=True,
+        )
 
 
 def _raise_for_result_problems(
@@ -610,6 +916,35 @@ def orchestrate(args: argparse.Namespace) -> int:
                 fix_round += 1
                 print(f"Reviewer {outer_round}, fix round {fix_round}: sending findings to implementer", file=sys.stderr)
 
+                if fix_round == 1:
+                    print(
+                        "Checking implementer context before first fix round",
+                        file=sys.stderr,
+                    )
+                    precompact_result = maybe_compact_implementer_before_first_fix(
+                        codex_bin=args.codex_bin,
+                        cwd=cwd,
+                        implementer_thread_id=args.implementer_codex_session_id,
+                        implementer_model=implementer_model,
+                        threshold_percent=args.implementer_compact_threshold_percent,
+                    )
+                    print(precompact_result.message, file=sys.stderr)
+                    audit.log(
+                        "implementer_precompact",
+                        review_round=outer_round,
+                        fix_round=fix_round,
+                        reviewer_thread_id=reviewer.thread_id,
+                        message=precompact_result.message,
+                        extra={
+                            "status": precompact_result.status,
+                            "total_tokens": precompact_result.total_tokens,
+                            "context_window": precompact_result.context_window,
+                            "usage_percent": precompact_result.usage_percent,
+                            "threshold_percent": args.implementer_compact_threshold_percent,
+                            "compacted": precompact_result.compacted,
+                        },
+                    )
+
                 implementer_prompt = f"{current_prompt}\n\n{current_comments}"
                 fix_result = implementer.fix(implementer_prompt)
                 fix_errors, fix_diagnostics = _collect_problem_lines(fix_result)
@@ -723,6 +1058,25 @@ def _stringify_error(value: Any) -> str:
     return str(value)
 
 
+def _get_nested(value: Any, *keys: str) -> Any:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
 def parse_positive_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -730,6 +1084,16 @@ def parse_positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be a positive integer") from exc
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def parse_percent(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a percentage from 0 to 100") from exc
+    if parsed < 0 or parsed > 100:
+        raise argparse.ArgumentTypeError("must be a percentage from 0 to 100")
     return parsed
 
 
@@ -783,6 +1147,7 @@ def build_parser() -> argparse.ArgumentParser:
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-new-reviewer-streams 3
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-fix-rounds-per-reviewer 2
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer-compact-threshold-percent 60
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log true
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer-model "gpt 5.5 medium" --reviewer-model "gpt 5.4 xhigh"
 
@@ -819,6 +1184,17 @@ model_reasoning_effort="xhigh".""",
         default=True,
         metavar="true|false",
         help="Write JSONL audit logs containing prompts, responses, diagnostics, and usage. Default: true.",
+    )
+    parser.add_argument(
+        "--implementer-compact-threshold-percent",
+        type=parse_percent,
+        default=50.0,
+        metavar="PERCENT",
+        help=(
+            "Before the first fix round for each fresh reviewer stream, resume the implementer "
+            "through Codex app-server and compact if restored context usage is at or above this "
+            "percentage. Use 0 to disable. Default: 50."
+        ),
     )
     parser.add_argument(
         "--implementer-model",
@@ -866,6 +1242,9 @@ def main(argv: list[str] | None = None) -> int:
     except CodexResultDiagnostics as exc:
         print(f"error: {exc}", file=sys.stderr)
         _print_failure_details(exc.result)
+        return 1
+    except CodexAppServerFailure as exc:
+        print(f"error: implementer pre-fix compaction failed: {exc}", file=sys.stderr)
         return 1
     except LimitReached as exc:
         print(f"error: {exc}", file=sys.stderr)

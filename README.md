@@ -47,6 +47,18 @@ codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
   --max-fix-rounds-per-reviewer 2
 ```
 
+Before the first fix round for each fresh reviewer stream, the tool checks the
+implementer thread's restored context usage through Codex app-server. If usage is
+at or above 50%, it triggers Codex's built-in compaction before sending the
+reviewer findings to the implementer:
+
+```bash
+codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
+  --implementer-compact-threshold-percent 50
+```
+
+Use `0` to disable this pre-fix compaction check.
+
 Model arguments use `"<model> <reasoning_effort>"` or
 `"<model>:<reasoning_effort>"`:
 
