@@ -342,6 +342,11 @@ class CodexExecRunner:
                 diagnostics.append(line)
                 print(f"[{phase}] {line}", file=sys.stderr)
                 continue
+            if not isinstance(event, dict):
+                diagnostic = f"unexpected non-object JSON event: {line}"
+                diagnostics.append(diagnostic)
+                print(f"[{phase}] {diagnostic}", file=sys.stderr)
+                continue
 
             event_type = event.get("type")
             if isinstance(event_type, str):
