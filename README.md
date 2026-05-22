@@ -69,8 +69,8 @@ Model arguments use `"<model> <reasoning_effort>"` or
 
 ```bash
 codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
-  --implementer-model "gpt-5.5 medium" \
-  --reviewer-model "gpt-5.4 xhigh"
+  --implementer "gpt-5.5 medium" \
+  --reviewer "gpt-5.4 xhigh"
 ```
 
 The implementer session should not be controlled by another process while this

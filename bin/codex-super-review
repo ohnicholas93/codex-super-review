@@ -1230,7 +1230,7 @@ def build_parser() -> argparse.ArgumentParser:
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-fix-rounds-per-reviewer 2
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer-compact-threshold-percent 60
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log true
-  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer-model "gpt 5.5 medium" --reviewer-model "gpt 5.4 xhigh"
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer "gpt 5.5 medium" --reviewer "gpt 5.4 xhigh"
 
 The command must be run from the project root to review. The provided implementer
 session must be resumable by `codex exec resume`, and this harness should be the
@@ -1278,16 +1278,28 @@ model_reasoning_effort="xhigh".""",
         ),
     )
     parser.add_argument(
-        "--implementer-model",
+        "--implementer",
+        dest="implementer_model",
         default=DEFAULT_IMPLEMENTER_MODEL,
         metavar="MODEL EFFORT",
         help=f'Implementer model and reasoning effort. Default: "{DEFAULT_IMPLEMENTER_MODEL}".',
     )
     parser.add_argument(
-        "--reviewer-model",
+        "--implementer-model",
+        dest="implementer_model",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--reviewer",
+        dest="reviewer_model",
         default=DEFAULT_REVIEWER_MODEL,
         metavar="MODEL EFFORT",
         help=f'Reviewer model and reasoning effort. Default: "{DEFAULT_REVIEWER_MODEL}".',
+    )
+    parser.add_argument(
+        "--reviewer-model",
+        dest="reviewer_model",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--codex-bin",
