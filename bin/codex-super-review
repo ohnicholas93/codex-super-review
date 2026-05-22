@@ -876,6 +876,7 @@ class CodexOracle:
         self.audit = audit
         self.max_retries = max_retries
         self.thread_id: str | None = None
+        self.reset_client_after_failure = False
 
     def classify(
         self,
@@ -905,9 +906,11 @@ class CodexOracle:
         archive_reason: str,
     ) -> Any | None:
         archived_thread_id: str | None = None
+        self.reset_client_after_failure = False
         try:
             self.thread_id = self.client.start_thread(cwd=self.cwd)
         except CodexAppServerFailure as exc:
+            self.reset_client_after_failure = True
             self.audit.log(
                 "oracle_failed_open",
                 review_round=review_round,
@@ -927,6 +930,7 @@ class CodexOracle:
                     output_schema=output_schema,
                 )
             except CodexAppServerFailure as exc:
+                self.reset_client_after_failure = True
                 last_error = str(exc)
                 self.audit.log(
                     "oracle_failed_open",
@@ -1036,6 +1040,7 @@ class CodexOracle:
                         },
                     )
                 except CodexAppServerFailure as rollback_error:
+                    self.reset_client_after_failure = True
                     last_error = f"{last_error}; rollback failed: {rollback_error}"
                     break
 
@@ -1533,6 +1538,15 @@ def orchestrate(args: argparse.Namespace) -> int:
                             "Warning: oracle classification unavailable; continuing without rejected-finding dedupe",
                             file=sys.stderr,
                         )
+                        if oracle.reset_client_after_failure:
+                            audit.log(
+                                "oracle_client_reset",
+                                review_round=outer_round,
+                                message="resetting oracle app-server client after transport failure",
+                            )
+                            oracle_client.close()
+                            oracle_client = None
+                            oracle = None
                 if classification is not None:
                     audit.log(
                         "oracle_classification_result",
