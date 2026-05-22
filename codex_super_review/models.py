@@ -58,5 +58,5 @@ class AppServerTurnResult:
 
 @dataclass(frozen=True)
 class OracleClassification:
+    explanation: str
     status: str
-    rejected_findings_explanation: str

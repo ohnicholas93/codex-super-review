@@ -48,9 +48,9 @@ model_reasoning_effort="xhigh".""",
     parser.add_argument(
         "--max-new-reviewer-streams",
         type=parse_positive_int,
-        default=None,
+        default=15,
         metavar="N",
-        help="Maximum fresh reviewer streams to create. Default: infinite.",
+        help="Maximum fresh reviewer streams to create. Default: 15.",
     )
     parser.add_argument(
         "--max-fix-rounds-per-reviewer",

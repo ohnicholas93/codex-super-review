@@ -209,13 +209,13 @@ def oracle_output_schema() -> dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "explanation": {"type": "string"},
             "status": {
                 "type": "string",
                 "enum": sorted(ORACLE_STATUSES),
             },
-            "rejected_findings_explanation": {"type": "string"},
         },
-        "required": ["status", "rejected_findings_explanation"],
+        "required": ["explanation", "status"],
     }
 
 
@@ -230,22 +230,22 @@ def parse_oracle_classification(response: str) -> OracleClassification:
         raise ValueError(f"oracle response was not valid JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError("oracle response must be a JSON object")
+    explanation = payload.get("explanation")
+    if not isinstance(explanation, str):
+        raise ValueError("oracle explanation must be a string")
     status = payload.get("status")
-    explanation = payload.get("rejected_findings_explanation")
     if status not in ORACLE_STATUSES:
         raise ValueError(f"oracle status was invalid: {status!r}")
-    if not isinstance(explanation, str):
-        raise ValueError("oracle rejected_findings_explanation must be a string")
-    if status in {"ONLY_REJECTED_FINDINGS", "HAS_REJECTED_AND_NEW_FINDINGS"}:
-        if not explanation.strip():
-            raise ValueError(
-                "oracle rejected_findings_explanation must be non-empty for rejected statuses"
-            )
-    elif explanation.strip():
-        raise ValueError(
-            "oracle rejected_findings_explanation must be empty for NO_REJECTED_FINDINGS"
-        )
+    if not explanation.strip():
+        raise ValueError("oracle explanation must be non-empty")
+    keys = list(payload.keys())
+    if (
+        "explanation" in keys
+        and "status" in keys
+        and keys.index("explanation") > keys.index("status")
+    ):
+        raise ValueError("oracle explanation must come before status")
     return OracleClassification(
+        explanation=explanation.strip(),
         status=status,
-        rejected_findings_explanation=explanation.strip(),
     )

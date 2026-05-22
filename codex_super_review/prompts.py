@@ -47,8 +47,8 @@ The persistent oracle conversation receives developer responses in chronological
 Return JSON only, with this exact shape:
 
 {
-  "status": "ONLY_REJECTED_FINDINGS | HAS_REJECTED_AND_NEW_FINDINGS | NO_REJECTED_FINDINGS",
-  "rejected_findings_explanation": "..."
+  "explanation": "...",
+  "status": "ONLY_REJECTED_FINDINGS | HAS_REJECTED_AND_NEW_FINDINGS | NO_REJECTED_FINDINGS"
 }
 
 Rules:
@@ -56,8 +56,9 @@ Rules:
 - Use HAS_REJECTED_AND_NEW_FINDINGS when at least one current finding is clearly covered by explicit developer rejection and at least one current finding is not.
 - Use NO_REJECTED_FINDINGS when no current finding is clearly covered by explicit developer rejection, or when the latest developer response and prior oracle conversation contain no explicit rejection.
 - When responses conflict for the same finding, classify using the latest applicable developer response.
-- rejected_findings_explanation must be non-empty for ONLY_REJECTED_FINDINGS and HAS_REJECTED_AND_NEW_FINDINGS.
-- rejected_findings_explanation must be an empty string for NO_REJECTED_FINDINGS."""
+- explanation must always exist and must come before status in the JSON object.
+- For ONLY_REJECTED_FINDINGS and HAS_REJECTED_AND_NEW_FINDINGS, explanation must identify which current findings were previously rejected and why.
+- For NO_REJECTED_FINDINGS, explanation must briefly explain why no current finding is clearly covered by prior explicit rejection."""
 
 PROMPT_REWRITE_WITHOUT_REJECTED_FINDINGS = """An oracle detected that part of your review repeats findings the developer already explicitly rejected.
 

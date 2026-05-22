@@ -173,8 +173,8 @@ def orchestrate(args: argparse.Namespace) -> int:
                         reviewer_thread_id=reviewer.thread_id,
                         message=classification.status,
                         extra={
+                            "explanation": classification.explanation,
                             "status": classification.status,
-                            "rejected_findings_explanation": classification.rejected_findings_explanation,
                         },
                     )
                     if classification.status == "ONLY_REJECTED_FINDINGS":
@@ -184,7 +184,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                             reviewer_thread_id=reviewer.thread_id,
                             message="fresh reviewer only returned findings previously rejected by implementer",
                             extra={
-                                "rejected_findings_explanation": classification.rejected_findings_explanation,
+                                "explanation": classification.explanation,
                             },
                         )
                         print(
@@ -200,7 +200,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                                     reviewer,
                                     reviewer_model,
                                     current_comments,
-                                    classification.rejected_findings_explanation,
+                                    classification.explanation,
                                     review_round=outer_round,
                                     audit=audit,
                                     round_diagnostics=round_diagnostics,
@@ -219,7 +219,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                                     "continuing with original reviewer comments"
                                 ),
                                 extra={
-                                    "rejected_findings_explanation": classification.rejected_findings_explanation,
+                                    "explanation": classification.explanation,
                                     "phase": exc.phase,
                                 },
                             )
@@ -238,7 +238,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                                     result=rewrite_result,
                                     message="sanitized reviewer comments returned NO_FINDINGS",
                                     extra={
-                                        "rejected_findings_explanation": classification.rejected_findings_explanation,
+                                        "explanation": classification.explanation,
                                     },
                                 )
                                 print(
