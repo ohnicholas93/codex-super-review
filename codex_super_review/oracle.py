@@ -30,18 +30,17 @@ class CodexOracle:
     def classify(
         self,
         *,
-        developer_responses: list[str],
+        latest_developer_response: str,
         current_findings: str,
         review_round: int,
     ) -> OracleClassification | None:
-        prompt = build_oracle_prompt(developer_responses, current_findings)
+        prompt = build_oracle_prompt(latest_developer_response, current_findings)
         return self._run_structured_turn(
             prompt=prompt,
             output_schema=oracle_output_schema(),
             parser=parse_oracle_classification,
             review_round=review_round,
             audit_event="oracle_classification",
-            archive_reason="classification_complete",
         )
 
     def _run_structured_turn(
@@ -52,20 +51,9 @@ class CodexOracle:
         parser: Callable[[str], Any],
         review_round: int,
         audit_event: str,
-        archive_reason: str,
     ) -> Any | None:
-        archived_thread_id: str | None = None
         self.reset_client_after_failure = False
-        try:
-            self.thread_id = self.client.start_thread(cwd=self.cwd)
-        except CodexAppServerFailure as exc:
-            self.reset_client_after_failure = True
-            self.audit.log(
-                "oracle_failed_open",
-                review_round=review_round,
-                message=str(exc),
-                extra={"phase": "thread/start"},
-            )
+        if not self._ensure_thread(review_round=review_round):
             return None
 
         attempts = self.max_retries + 1
@@ -91,10 +79,6 @@ class CodexOracle:
                         "oracle_thread_id": self.thread_id,
                         "discarded_oracle_thread": True,
                     },
-                )
-                archived_thread_id = self._archive_current_thread(
-                    review_round=review_round,
-                    reason="run_turn_failure",
                 )
                 self.thread_id = None
                 return None
@@ -139,6 +123,7 @@ class CodexOracle:
                         },
                     )
                 except CodexAppServerFailure as rollback_error:
+                    self.reset_client_after_failure = True
                     self.audit.log(
                         "oracle_rollback_failed",
                         review_round=review_round,
@@ -149,19 +134,10 @@ class CodexOracle:
                             "turn_status": result.turn_status,
                         },
                     )
-                archived_thread_id = self._archive_current_thread(
-                    review_round=review_round,
-                    reason="unsuccessful_turn",
-                )
-                self.thread_id = None
+                    self.thread_id = None
                 return None
             try:
                 parsed = parser(result.response)
-                archived_thread_id = self._archive_current_thread(
-                    review_round=review_round,
-                    reason=archive_reason,
-                )
-                self.thread_id = None
                 return parsed
             except ValueError as exc:
                 last_error = str(exc)
@@ -191,6 +167,7 @@ class CodexOracle:
                 except CodexAppServerFailure as rollback_error:
                     self.reset_client_after_failure = True
                     last_error = f"{last_error}; rollback failed: {rollback_error}"
+                    self.thread_id = None
                     break
 
         self.audit.log(
@@ -199,44 +176,31 @@ class CodexOracle:
             message=last_error or "oracle failed to produce parseable output",
             extra={
                 "oracle_thread_id": self.thread_id,
-                "archived_oracle_thread_id": archived_thread_id,
                 "attempts": attempts,
             },
         )
-        if self.thread_id is not None:
-            self._archive_current_thread(
-                review_round=review_round,
-                reason="classification_failed",
-            )
-        self.thread_id = None
         return None
 
-    def _archive_current_thread(
-        self,
-        *,
-        review_round: int,
-        reason: str,
-    ) -> str | None:
-        thread_id = self.thread_id
-        if thread_id is None:
-            return None
+    def _ensure_thread(self, *, review_round: int) -> bool:
+        if self.thread_id is not None:
+            return True
         try:
-            self.client.archive_thread(thread_id)
+            self.thread_id = self.client.start_thread(cwd=self.cwd)
             self.audit.log(
-                "oracle_thread_archived",
+                "oracle_thread_started",
                 review_round=review_round,
-                message=f"archived oracle thread after {reason}",
-                extra={"oracle_thread_id": thread_id, "reason": reason},
+                extra={"oracle_thread_id": self.thread_id},
             )
-            return thread_id
         except CodexAppServerFailure as exc:
+            self.reset_client_after_failure = True
             self.audit.log(
-                "oracle_thread_archive_failed",
+                "oracle_failed_open",
                 review_round=review_round,
                 message=str(exc),
-                extra={"oracle_thread_id": thread_id, "reason": reason},
+                extra={"phase": "thread/start"},
             )
-            return None
+            return False
+        return True
 
 
 

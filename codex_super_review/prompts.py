@@ -36,13 +36,13 @@ If some command fails due to permission issues, retry it with escalation. If har
 
 PROMPT_ORACLE_CLASSIFY_REJECTED_FINDINGS = """You are an oracle classifier for an automated code-review workflow.
 
-You are checking whether a fresh reviewer's current findings repeat findings already explicitly rejected by the developer in previous responses.
+You are checking whether a fresh reviewer's current findings repeat findings already explicitly rejected by the developer in this persistent oracle conversation.
 
-The developer responses may or may not contain an explicit rejection. If they do not, classify as NO_REJECTED_FINDINGS.
+The latest developer response may or may not contain an explicit rejection. If the latest response and prior oracle conversation do not show an explicit rejection covering the current findings, classify as NO_REJECTED_FINDINGS.
 
-Do not judge whether the developer was correct. Trust the developer. Only classify whether current reviewer findings are clearly covered by an explicit rejection in the developer responses.
+Do not judge whether the developer was correct. Trust the developer. Only classify whether current reviewer findings are clearly covered by an explicit rejection in the latest developer response or prior oracle conversation.
 
-Developer responses are provided in chronological order. A later response supersedes earlier responses for the same finding. If the developer later accepts, fixes, or otherwise withdraws an earlier rejection for the same issue, do not treat that earlier rejection as covering the current finding.
+The persistent oracle conversation receives developer responses in chronological order, one response per classification turn. A later response supersedes earlier responses for the same finding. If the developer later accepts, fixes, or otherwise withdraws an earlier rejection for the same issue, do not treat that earlier rejection as covering the current finding.
 
 Return JSON only, with this exact shape:
 
@@ -54,7 +54,7 @@ Return JSON only, with this exact shape:
 Rules:
 - Use ONLY_REJECTED_FINDINGS when every current finding is clearly covered by explicit developer rejection.
 - Use HAS_REJECTED_AND_NEW_FINDINGS when at least one current finding is clearly covered by explicit developer rejection and at least one current finding is not.
-- Use NO_REJECTED_FINDINGS when no current finding is clearly covered by explicit developer rejection, or when the developer responses contain no explicit rejection.
+- Use NO_REJECTED_FINDINGS when no current finding is clearly covered by explicit developer rejection, or when the latest developer response and prior oracle conversation contain no explicit rejection.
 - When responses conflict for the same finding, classify using the latest applicable developer response.
 - rejected_findings_explanation must be non-empty for ONLY_REJECTED_FINDINGS and HAS_REJECTED_AND_NEW_FINDINGS.
 - rejected_findings_explanation must be an empty string for NO_REJECTED_FINDINGS."""
@@ -103,13 +103,10 @@ def build_reverify_retry_prompt(reviewer_comments: str, developer_response: str)
     )
 
 
-def build_oracle_prompt(developer_responses: list[str], current_findings: str) -> str:
+def build_oracle_prompt(latest_developer_response: str, current_findings: str) -> str:
     payload = json.dumps(
         {
-            "developer_responses": [
-                {"index": index, "response": response}
-                for index, response in enumerate(developer_responses, start=1)
-            ],
+            "latest_developer_response": latest_developer_response,
             "current_reviewer_findings": current_findings,
         },
         ensure_ascii=False,

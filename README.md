@@ -80,8 +80,8 @@ tool is running.
 ## Rejected Finding Oracle
 
 Starting with the second fresh reviewer stream, `codex-super-review` asks a
-fresh oracle thread whether the new findings are only, partly, or not at all
-covered by the implementer's previous explicit rejection.
+persistent oracle thread whether the new findings are only, partly, or not at
+all covered by the implementer's previous explicit rejection.
 
 If the oracle reports only previously rejected findings, the run terminates
 successfully with an audit reason. If it reports a mix of rejected and new

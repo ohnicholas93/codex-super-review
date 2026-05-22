@@ -148,7 +148,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                     )
                     classification = oracle.classify(
-                        developer_responses=implementer_responses,
+                        latest_developer_response=implementer_responses[-1],
                         current_findings=current_comments,
                         review_round=outer_round,
                     )
