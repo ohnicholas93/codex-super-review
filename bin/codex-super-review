@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -17,17 +18,25 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 DEFAULT_IMPLEMENTER_MODEL = "gpt-5.4 high"
 DEFAULT_REVIEWER_MODEL = "gpt-5.4 medium"
+DEFAULT_ORACLE_MODEL = "gpt-5.4-mini low"
 IMPLEMENTER_APPROVALS_REVIEWER = "auto_review"
 IMPLEMENTER_APPROVAL_POLICY = "on-request"
 MAX_REVIEWER_TOOL_RETRIES = 2
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 APP_SERVER_COMPACTION_TIMEOUT_SECONDS = 900
 APP_SERVER_TOKEN_USAGE_TIMEOUT_SECONDS = 30
+APP_SERVER_ORACLE_TURN_TIMEOUT_SECONDS = 300
+APP_SERVER_ROLLBACK_TIMEOUT_SECONDS = 60
 CODEX_TUI_CONTEXT_BASELINE_TOKENS = 12_000
+ORACLE_STATUSES = {
+    "ONLY_REJECTED_FINDINGS",
+    "HAS_REJECTED_AND_NEW_FINDINGS",
+    "NO_REJECTED_FINDINGS",
+}
 
 PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings. Try to be comprehensive and precise so as to not require unnecessarily frequent back-and-forths with the developer.
 
@@ -38,6 +47,8 @@ NO_FINDINGS
 If you do find issues, do not include the string NO_FINDINGS anywhere in your response."""
 
 PROMPT_VALIDATE_FIX_COMMENTS = """Another developer wrote these comments regarding your changes (currently uncommitted in git). Please verify and check the correctness and applicability of their findings. If their concerns are valid and appropriate, please fix and address them.
+
+Reject review comments that are out of scope for the current change, or would cause unrelated scope creep. Do not implement broad refactors, product changes, speculative hardening, or unrelated cleanup merely because a reviewer suggested them. If a review comment is invalid or out of scope, say so clearly and leave the code unchanged for that comment.
 
 If some command fails due to permission issues, retry it with escalation. If harmless, an oracle will approve it."""
 
@@ -53,7 +64,51 @@ If remaining issues are not solvable by implementer, it would count as NO_FINDIN
 
 PROMPT_VALIDATE_FOLLOWUP_COMMENTS = """The reviewing developer returned with the following notes. Please verify and check the correctness and applicability of their findings. If their concerns are valid and appropriate, please fix and address them.
 
+Reject review comments that are out of scope for the current change, or would cause unrelated scope creep. Do not implement broad refactors, product changes, speculative hardening, or unrelated cleanup merely because a reviewer suggested them. If a review comment is invalid or out of scope, say so clearly and leave the code unchanged for that comment.
+
 If some command fails due to permission issues, retry it with escalation. If harmless, an oracle will approve it."""
+
+PROMPT_ORACLE_CLASSIFY_REJECTED_FINDINGS = """You are an oracle classifier for an automated code-review workflow.
+
+You are checking whether a fresh reviewer's current findings repeat findings already explicitly rejected by the developer in previous responses.
+
+The developer responses may or may not contain an explicit rejection. If they do not, classify as NO_REJECTED_FINDINGS.
+
+Do not judge whether the developer was correct. Trust the developer. Only classify whether current reviewer findings are clearly covered by an explicit rejection in the developer responses.
+
+Developer responses are provided in chronological order. A later response supersedes earlier responses for the same finding. If the developer later accepts, fixes, or otherwise withdraws an earlier rejection for the same issue, do not treat that earlier rejection as covering the current finding.
+
+Return JSON only, with this exact shape:
+
+{
+  "status": "ONLY_REJECTED_FINDINGS | HAS_REJECTED_AND_NEW_FINDINGS | NO_REJECTED_FINDINGS",
+  "rejected_findings_explanation": "..."
+}
+
+Rules:
+- Use ONLY_REJECTED_FINDINGS when every current finding is clearly covered by explicit developer rejection.
+- Use HAS_REJECTED_AND_NEW_FINDINGS when at least one current finding is clearly covered by explicit developer rejection and at least one current finding is not.
+- Use NO_REJECTED_FINDINGS when no current finding is clearly covered by explicit developer rejection, or when the developer responses contain no explicit rejection.
+- When responses conflict for the same finding, classify using the latest applicable developer response.
+- rejected_findings_explanation must be non-empty for ONLY_REJECTED_FINDINGS and HAS_REJECTED_AND_NEW_FINDINGS.
+- rejected_findings_explanation must be an empty string for NO_REJECTED_FINDINGS."""
+
+PROMPT_REWRITE_WITHOUT_REJECTED_FINDINGS = """An oracle detected that part of your review repeats findings the developer already explicitly rejected.
+
+Please rewrite the review comments below nearly identically, but remove the rejected finding(s) described below, as if they had never been part of your review. Keep every remaining finding, severity, file reference, and rationale unchanged except for small wording adjustments needed after removal.
+
+The rewritten comments will be sent to the developer.
+
+Do not add new findings.
+Do not re-evaluate the code.
+Only remove the rejected finding(s).
+If removing the rejected finding(s) leaves no remaining actionable findings, your final response must be exactly:
+
+NO_FINDINGS
+
+The rejected finding description and review comments are provided as JSON:
+
+{rewrite_payload_json}"""
 
 NO_FINDINGS = "NO_FINDINGS"
 
@@ -131,6 +186,20 @@ class PreCompactResult:
     context_window: int | None = None
     usage_percent: float | None = None
     compacted: bool = False
+
+
+@dataclass(frozen=True)
+class AppServerTurnResult:
+    thread_id: str
+    turn_id: str
+    response: str
+    turn_status: str | None = None
+
+
+@dataclass(frozen=True)
+class OracleClassification:
+    status: str
+    rejected_findings_explanation: str
 
 
 class AuditLogger:
@@ -497,6 +566,106 @@ class AppServerJsonRpcClient:
                     return token_usage
         return None
 
+    def start_thread(self, *, cwd: Path | None = None) -> str:
+        self._clear_stale_messages()
+        effective_cwd = cwd or self.cwd
+        result = self.request(
+            "thread/start",
+            {
+                "model": self.model_spec.model,
+                "cwd": str(effective_cwd),
+                "sandbox": "read-only",
+                "approvalPolicy": "never",
+                "config": {"model_reasoning_effort": self.model_spec.reasoning_effort},
+            },
+            timeout=60,
+        )
+        thread_id = _get_nested(result, "thread", "id")
+        if not isinstance(thread_id, str) or not thread_id:
+            raise CodexAppServerFailure("thread/start did not return a thread id")
+        return thread_id
+
+    def run_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        *,
+        cwd: Path | None = None,
+        output_schema: dict[str, Any] | None = None,
+        timeout: int = APP_SERVER_ORACLE_TURN_TIMEOUT_SECONDS,
+    ) -> AppServerTurnResult:
+        self._clear_stale_messages()
+        effective_cwd = cwd or self.cwd
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+            "cwd": str(effective_cwd),
+            "model": self.model_spec.model,
+            "effort": self.model_spec.reasoning_effort,
+            "sandboxPolicy": {"type": "readOnly"},
+            "approvalPolicy": "never",
+        }
+        if output_schema is not None:
+            params["outputSchema"] = output_schema
+
+        result = self.request("turn/start", params, timeout=60)
+        turn_id = _get_nested(result, "turn", "id")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise CodexAppServerFailure("turn/start did not return a turn id")
+
+        items: list[Any] = []
+        turn_status: str | None = None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            message = self.next_message(timeout=max(0.1, deadline - time.monotonic()))
+            if message is None:
+                break
+            if _get_nested(message, "params", "threadId") != thread_id:
+                continue
+            message_turn_id = _turn_id_from_message(message)
+
+            method = message.get("method")
+            if method == "item/completed":
+                if message_turn_id != turn_id:
+                    continue
+                item = _get_nested(message, "params", "item")
+                if isinstance(item, dict):
+                    items.append(item)
+            elif method == "turn/completed":
+                turn = _get_nested(message, "params", "turn")
+                if isinstance(turn, dict):
+                    completed_turn_id = turn.get("id")
+                    if completed_turn_id != turn_id:
+                        continue
+                    status = turn.get("status")
+                    if isinstance(status, str):
+                        turn_status = status
+                    completed_items = turn.get("items")
+                    if isinstance(completed_items, list):
+                        items = _merge_app_server_items(items, completed_items)
+                return AppServerTurnResult(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    response=_final_assistant_response_from_items(items),
+                    turn_status=turn_status,
+                )
+
+        raise CodexAppServerFailure(
+            f"timed out waiting for app-server turn {turn_id} to complete"
+        )
+
+    def rollback_thread(self, thread_id: str, num_turns: int = 1) -> None:
+        self._clear_stale_messages()
+        self.request(
+            "thread/rollback",
+            {"threadId": thread_id, "numTurns": num_turns},
+            timeout=APP_SERVER_ROLLBACK_TIMEOUT_SECONDS,
+        )
+
+    def archive_thread(self, thread_id: str) -> None:
+        self._clear_stale_messages()
+        self.request("thread/archive", {"threadId": thread_id}, timeout=60)
+
     def compact_thread(self, thread_id: str) -> None:
         self._clear_stale_messages()
         self.request("thread/compact/start", {"threadId": thread_id}, timeout=60)
@@ -692,6 +861,228 @@ class CodexImplementer:
             approvals_reviewer=IMPLEMENTER_APPROVALS_REVIEWER,
         )
         return result
+
+
+class CodexOracle:
+    def __init__(
+        self,
+        client: AppServerJsonRpcClient,
+        cwd: Path,
+        audit: AuditLogger,
+        max_retries: int,
+    ) -> None:
+        self.client = client
+        self.cwd = cwd
+        self.audit = audit
+        self.max_retries = max_retries
+        self.thread_id: str | None = None
+
+    def classify(
+        self,
+        *,
+        developer_responses: list[str],
+        current_findings: str,
+        review_round: int,
+    ) -> OracleClassification | None:
+        prompt = build_oracle_prompt(developer_responses, current_findings)
+        return self._run_structured_turn(
+            prompt=prompt,
+            output_schema=oracle_output_schema(),
+            parser=parse_oracle_classification,
+            review_round=review_round,
+            audit_event="oracle_classification",
+            archive_reason="classification_complete",
+        )
+
+    def _run_structured_turn(
+        self,
+        *,
+        prompt: str,
+        output_schema: dict[str, Any],
+        parser: Callable[[str], Any],
+        review_round: int,
+        audit_event: str,
+        archive_reason: str,
+    ) -> Any | None:
+        archived_thread_id: str | None = None
+        try:
+            self.thread_id = self.client.start_thread(cwd=self.cwd)
+        except CodexAppServerFailure as exc:
+            self.audit.log(
+                "oracle_failed_open",
+                review_round=review_round,
+                message=str(exc),
+                extra={"phase": "thread/start"},
+            )
+            return None
+
+        attempts = self.max_retries + 1
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                result = self.client.run_turn(
+                    self.thread_id,
+                    prompt,
+                    cwd=self.cwd,
+                    output_schema=output_schema,
+                )
+            except CodexAppServerFailure as exc:
+                last_error = str(exc)
+                self.audit.log(
+                    "oracle_failed_open",
+                    review_round=review_round,
+                    prompt=prompt,
+                    message=last_error,
+                    extra={
+                        "attempt": attempt,
+                        "oracle_thread_id": self.thread_id,
+                        "discarded_oracle_thread": True,
+                    },
+                )
+                archived_thread_id = self._archive_current_thread(
+                    review_round=review_round,
+                    reason="run_turn_failure",
+                )
+                self.thread_id = None
+                return None
+            self.audit.log(
+                audit_event,
+                review_round=review_round,
+                prompt=prompt,
+                response=result.response,
+                extra={
+                    "attempt": attempt,
+                    "oracle_thread_id": self.thread_id,
+                    "oracle_turn_id": result.turn_id,
+                    "turn_status": result.turn_status,
+                },
+            )
+            if result.turn_status != "completed":
+                last_error = f"oracle turn ended with status {result.turn_status!r}"
+                self.audit.log(
+                    "oracle_failed_open",
+                    review_round=review_round,
+                    prompt=prompt,
+                    response=result.response,
+                    message=last_error,
+                    extra={
+                        "attempt": attempt,
+                        "oracle_thread_id": self.thread_id,
+                        "oracle_turn_id": result.turn_id,
+                        "turn_status": result.turn_status,
+                    },
+                )
+                try:
+                    self.client.rollback_thread(self.thread_id, 1)
+                    self.audit.log(
+                        "oracle_rollback",
+                        review_round=review_round,
+                        message="rolled back unsuccessful oracle turn",
+                        extra={
+                            "attempt": attempt,
+                            "oracle_thread_id": self.thread_id,
+                            "num_turns": 1,
+                            "turn_status": result.turn_status,
+                        },
+                    )
+                except CodexAppServerFailure as rollback_error:
+                    self.audit.log(
+                        "oracle_rollback_failed",
+                        review_round=review_round,
+                        message=str(rollback_error),
+                        extra={
+                            "attempt": attempt,
+                            "oracle_thread_id": self.thread_id,
+                            "turn_status": result.turn_status,
+                        },
+                    )
+                archived_thread_id = self._archive_current_thread(
+                    review_round=review_round,
+                    reason="unsuccessful_turn",
+                )
+                self.thread_id = None
+                return None
+            try:
+                parsed = parser(result.response)
+                archived_thread_id = self._archive_current_thread(
+                    review_round=review_round,
+                    reason=archive_reason,
+                )
+                self.thread_id = None
+                return parsed
+            except ValueError as exc:
+                last_error = str(exc)
+                self.audit.log(
+                    "oracle_parse_failed",
+                    review_round=review_round,
+                    response=result.response,
+                    message=last_error,
+                    extra={
+                        "attempt": attempt,
+                        "oracle_thread_id": self.thread_id,
+                        "oracle_turn_id": result.turn_id,
+                    },
+                )
+                try:
+                    self.client.rollback_thread(self.thread_id, 1)
+                    self.audit.log(
+                        "oracle_rollback",
+                        review_round=review_round,
+                        message="rolled back malformed oracle turn",
+                        extra={
+                            "attempt": attempt,
+                            "oracle_thread_id": self.thread_id,
+                            "num_turns": 1,
+                        },
+                    )
+                except CodexAppServerFailure as rollback_error:
+                    last_error = f"{last_error}; rollback failed: {rollback_error}"
+                    break
+
+        self.audit.log(
+            "oracle_failed_open",
+            review_round=review_round,
+            message=last_error or "oracle failed to produce parseable output",
+            extra={
+                "oracle_thread_id": self.thread_id,
+                "archived_oracle_thread_id": archived_thread_id,
+                "attempts": attempts,
+            },
+        )
+        if self.thread_id is not None:
+            self._archive_current_thread(
+                review_round=review_round,
+                reason="classification_failed",
+            )
+        self.thread_id = None
+        return None
+
+    def _archive_current_thread(
+        self,
+        *,
+        review_round: int,
+        reason: str,
+    ) -> str | None:
+        thread_id = self.thread_id
+        if thread_id is None:
+            return None
+        try:
+            self.client.archive_thread(thread_id)
+            self.audit.log(
+                "oracle_thread_archived",
+                review_round=review_round,
+                message=f"archived oracle thread after {reason}",
+                extra={"oracle_thread_id": thread_id, "reason": reason},
+            )
+            return thread_id
+        except CodexAppServerFailure as exc:
+            self.audit.log(
+                "oracle_thread_archive_failed",
+                review_round=review_round,
+                message=str(exc),
+                extra={"oracle_thread_id": thread_id, "reason": reason},
+            )
+            return None
 
 
 def _collect_problem_lines(result: CodexResult) -> tuple[list[str], list[str]]:
@@ -927,11 +1318,109 @@ def _run_reviewer_reverify_with_retries(
             current_reviewer = CodexReviewer(runner, reviewer_model)
 
 
+def _run_reviewer_rewrite_without_rejected_with_retries(
+    runner: CodexExecRunner,
+    reviewer: CodexReviewer,
+    reviewer_model: ModelSpec,
+    reviewer_comments: str,
+    rejected_findings_explanation: str,
+    *,
+    review_round: int,
+    audit: AuditLogger,
+    round_diagnostics: list[RoundDiagnostics],
+) -> tuple[CodexReviewer, CodexResult]:
+    attempt = 0
+    while True:
+        rewrite_prompt = build_rewrite_without_rejected_prompt(
+            reviewer_comments,
+            rejected_findings_explanation,
+        )
+        if attempt > 0:
+            current_reviewer = CodexReviewer(runner, reviewer_model)
+            result = current_reviewer.review(rewrite_prompt)
+        else:
+            current_reviewer = reviewer
+            result = current_reviewer.reverify(rewrite_prompt)
+        rewrite_errors, rewrite_diagnostics = _collect_problem_lines(result)
+        if rewrite_errors or rewrite_diagnostics:
+            round_diagnostics.append(
+                RoundDiagnostics(
+                    phase="reviewer-rewrite-without-rejected",
+                    review_round=review_round,
+                    fix_round=None,
+                    errors=rewrite_errors,
+                    diagnostics=rewrite_diagnostics,
+                )
+            )
+        audit.log(
+            "reviewer_rewrite_without_rejected",
+            review_round=review_round,
+            reviewer_thread_id=current_reviewer.thread_id,
+            prompt=rewrite_prompt,
+            response=result.response,
+            result=result,
+            extra={
+                "rejected_findings_explanation": rejected_findings_explanation,
+                "attempt": attempt + 1,
+            },
+        )
+        try:
+            ensure_success("reviewer rewrite without rejected findings", result)
+            _raise_for_result_problems(
+                "reviewer rewrite without rejected findings",
+                result,
+                allow_diagnostics=False,
+            )
+            if current_reviewer.thread_id is None:
+                raise RuntimeError("reviewer did not emit a thread id")
+            if no_findings(result.response):
+                audit.log(
+                    "complete_rewrite_without_rejected_findings",
+                    review_round=review_round,
+                    reviewer_thread_id=current_reviewer.thread_id,
+                    prompt=rewrite_prompt,
+                    response=result.response,
+                    result=result,
+                    message=(
+                        "rewrite returned NO_FINDINGS after removing previously rejected findings"
+                    ),
+                    extra={
+                        "attempt": attempt + 1,
+                        "rejected_findings_explanation": rejected_findings_explanation,
+                    },
+                )
+            return current_reviewer, result
+        except (CodexRunFailure, CodexResultDiagnostics) as exc:
+            if attempt >= MAX_REVIEWER_TOOL_RETRIES:
+                raise exc
+            attempt += 1
+            print(
+                f"Reviewer stream {review_round} hit a transient failure while rewriting rejected findings; retrying with a fresh reviewer ({attempt}/{MAX_REVIEWER_TOOL_RETRIES})",
+                file=sys.stderr,
+            )
+            audit.log(
+                "reviewer_retryable_failure",
+                review_round=review_round,
+                reviewer_thread_id=current_reviewer.thread_id,
+                prompt=rewrite_prompt,
+                response=result.response,
+                result=result,
+                message=f"rewrite without rejected findings retry {attempt} of {MAX_REVIEWER_TOOL_RETRIES}",
+                extra={
+                    "rejected_findings_explanation": rejected_findings_explanation,
+                },
+            )
+
+
 def orchestrate(args: argparse.Namespace) -> int:
     cwd = Path.cwd()
     runner = CodexExecRunner(args.codex_bin, cwd)
     implementer_model = parse_model_spec(args.implementer_model)
     reviewer_model = parse_model_spec(args.reviewer_model)
+    oracle_model = parse_model_spec(args.oracle_model)
+    oracle_cwd = default_oracle_cwd()
+    oracle_client: AppServerJsonRpcClient | None = None
+    oracle: CodexOracle | None = None
     implementer = CodexImplementer(
         runner, args.implementer_codex_session_id, implementer_model
     )
@@ -943,6 +1432,7 @@ def orchestrate(args: argparse.Namespace) -> int:
         reviewer_model,
     )
     round_diagnostics: list[RoundDiagnostics] = []
+    implementer_responses: list[str] = []
 
     try:
         if audit.path is not None:
@@ -959,6 +1449,8 @@ def orchestrate(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         print(f"Requested reviewer model: {reviewer_model.display}", file=sys.stderr)
+        print(f"Requested oracle model: {oracle_model.display}", file=sys.stderr)
+        print(f"Oracle workspace: {oracle_cwd}", file=sys.stderr)
 
         outer_round = 0
         while _has_round_remaining(outer_round, args.max_new_reviewer_streams):
@@ -986,6 +1478,141 @@ def orchestrate(args: argparse.Namespace) -> int:
             fix_round = 0
             current_prompt = PROMPT_VALIDATE_FIX_COMMENTS
             current_comments = review_result.response
+
+            if outer_round >= 2 and implementer_responses:
+                if oracle_client is None:
+                    candidate_oracle_client = None
+                    try:
+                        oracle_cwd.mkdir(parents=True, exist_ok=True)
+                        candidate_oracle_client = AppServerJsonRpcClient(
+                            args.codex_bin, oracle_cwd, oracle_model
+                        )
+                        candidate_oracle_client.__enter__()
+                    except (
+                        OSError,
+                        CodexAppServerFailure,
+                        CodexExecutableNotFound,
+                    ) as exc:
+                        if candidate_oracle_client is not None:
+                            candidate_oracle_client.close()
+                        audit.log(
+                            "oracle_failed_open",
+                            review_round=outer_round,
+                            message=str(exc),
+                            extra={
+                                "phase": "startup",
+                                "oracle_workspace": str(oracle_cwd),
+                            },
+                        )
+                        print(
+                            f"Warning: oracle unavailable; continuing without rejected-finding dedupe ({exc})",
+                            file=sys.stderr,
+                        )
+                        candidate_oracle_client = None
+                    if candidate_oracle_client is not None:
+                        oracle_client = candidate_oracle_client
+                        oracle = CodexOracle(
+                            oracle_client,
+                            oracle_cwd,
+                            audit,
+                            args.max_oracle_retries,
+                        )
+                classification = None
+                if oracle is not None:
+                    print(
+                        f"Reviewer stream {outer_round}: checking for previously rejected findings",
+                        file=sys.stderr,
+                    )
+                    classification = oracle.classify(
+                        developer_responses=implementer_responses,
+                        current_findings=current_comments,
+                        review_round=outer_round,
+                    )
+                    if classification is None:
+                        print(
+                            "Warning: oracle classification unavailable; continuing without rejected-finding dedupe",
+                            file=sys.stderr,
+                        )
+                if classification is not None:
+                    audit.log(
+                        "oracle_classification_result",
+                        review_round=outer_round,
+                        reviewer_thread_id=reviewer.thread_id,
+                        message=classification.status,
+                        extra={
+                            "status": classification.status,
+                            "rejected_findings_explanation": classification.rejected_findings_explanation,
+                        },
+                    )
+                    if classification.status == "ONLY_REJECTED_FINDINGS":
+                        audit.log(
+                            "complete_only_rejected_findings",
+                            review_round=outer_round,
+                            reviewer_thread_id=reviewer.thread_id,
+                            message="fresh reviewer only returned findings previously rejected by implementer",
+                            extra={
+                                "rejected_findings_explanation": classification.rejected_findings_explanation,
+                            },
+                        )
+                        print(
+                            "Complete: fresh reviewer only returned previously rejected findings",
+                            file=sys.stderr,
+                        )
+                        return 0
+                    if classification.status == "HAS_REJECTED_AND_NEW_FINDINGS":
+                        try:
+                            reviewer, rewrite_result = (
+                                _run_reviewer_rewrite_without_rejected_with_retries(
+                                    runner,
+                                    reviewer,
+                                    reviewer_model,
+                                    current_comments,
+                                    classification.rejected_findings_explanation,
+                                    review_round=outer_round,
+                                    audit=audit,
+                                    round_diagnostics=round_diagnostics,
+                                )
+                            )
+                        except (CodexRunFailure, CodexResultDiagnostics) as exc:
+                            failed_result = exc.result
+                            audit.log(
+                                "reviewer_rewrite_without_rejected_failed_open",
+                                review_round=outer_round,
+                                reviewer_thread_id=reviewer.thread_id,
+                                response=failed_result.response,
+                                result=failed_result,
+                                message=(
+                                    "rewrite without rejected findings failed; "
+                                    "continuing with original reviewer comments"
+                                ),
+                                extra={
+                                    "rejected_findings_explanation": classification.rejected_findings_explanation,
+                                    "phase": exc.phase,
+                                },
+                            )
+                            print(
+                                "Warning: reviewer rewrite without rejected findings failed; continuing with original reviewer comments",
+                                file=sys.stderr,
+                            )
+                        else:
+                            current_comments = rewrite_result.response
+                            if no_findings(current_comments):
+                                audit.log(
+                                    "complete_rewrite_without_rejected_findings",
+                                    review_round=outer_round,
+                                    reviewer_thread_id=reviewer.thread_id,
+                                    response=current_comments,
+                                    result=rewrite_result,
+                                    message="sanitized reviewer comments returned NO_FINDINGS",
+                                    extra={
+                                        "rejected_findings_explanation": classification.rejected_findings_explanation,
+                                    },
+                                )
+                                print(
+                                    "Complete: removing previously rejected findings left no remaining findings",
+                                    file=sys.stderr,
+                                )
+                                return 0
 
             while _has_round_remaining(fix_round, args.max_fix_rounds_per_reviewer):
                 fix_round += 1
@@ -1047,6 +1674,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                     result=fix_result,
                 )
                 ensure_success("implementer fix", fix_result)
+                implementer_responses.append(fix_result.response)
 
                 reverify_prompt = build_reverify_prompt(fix_result.response)
                 reviewer, reverify_result = _run_reviewer_reverify_with_retries(
@@ -1089,6 +1717,8 @@ def orchestrate(args: argparse.Namespace) -> int:
 
         raise LimitReached("max new reviewer streams reached before convergence")
     finally:
+        if oracle_client is not None:
+            oracle_client.close()
         audit.close()
 
 
@@ -1116,6 +1746,192 @@ def build_reverify_retry_prompt(reviewer_comments: str, developer_response: str)
         "</developer_response>\n\n"
         f"{PROMPT_REVERIFY_FIXES}"
     )
+
+
+def build_oracle_prompt(developer_responses: list[str], current_findings: str) -> str:
+    payload = json.dumps(
+        {
+            "developer_responses": [
+                {"index": index, "response": response}
+                for index, response in enumerate(developer_responses, start=1)
+            ],
+            "current_reviewer_findings": current_findings,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return (
+        f"{PROMPT_ORACLE_CLASSIFY_REJECTED_FINDINGS}\n\n"
+        "Classify the review findings using this JSON payload:\n\n"
+        f"{payload}"
+    )
+
+
+def build_rewrite_without_rejected_prompt(
+    review_comments: str,
+    rejected_findings_explanation: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "rejected_findings": rejected_findings_explanation,
+            "review_comments": review_comments,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return PROMPT_REWRITE_WITHOUT_REJECTED_FINDINGS.format(
+        rewrite_payload_json=payload,
+    )
+
+
+def oracle_output_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": sorted(ORACLE_STATUSES),
+            },
+            "rejected_findings_explanation": {"type": "string"},
+        },
+        "required": ["status", "rejected_findings_explanation"],
+    }
+
+
+def parse_oracle_classification(response: str) -> OracleClassification:
+    text = response.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"oracle response was not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("oracle response must be a JSON object")
+    status = payload.get("status")
+    explanation = payload.get("rejected_findings_explanation")
+    if status not in ORACLE_STATUSES:
+        raise ValueError(f"oracle status was invalid: {status!r}")
+    if not isinstance(explanation, str):
+        raise ValueError("oracle rejected_findings_explanation must be a string")
+    if status in {"ONLY_REJECTED_FINDINGS", "HAS_REJECTED_AND_NEW_FINDINGS"}:
+        if not explanation.strip():
+            raise ValueError(
+                "oracle rejected_findings_explanation must be non-empty for rejected statuses"
+            )
+    elif explanation.strip():
+        raise ValueError(
+            "oracle rejected_findings_explanation must be empty for NO_REJECTED_FINDINGS"
+        )
+    return OracleClassification(
+        status=status,
+        rejected_findings_explanation=explanation.strip(),
+    )
+
+
+def _thread_item_type(item: dict[str, Any]) -> str:
+    item_type = item.get("type")
+    if isinstance(item_type, str):
+        return item_type
+    # Older enum serializations can use variant names as object keys.
+    if "agentMessage" in item:
+        return "agentMessage"
+    if "AgentMessage" in item:
+        return "agentMessage"
+    return ""
+
+
+def _agent_message_payload(item: dict[str, Any]) -> dict[str, Any]:
+    if _thread_item_type(item) != "agentMessage":
+        return {}
+    for key in ("agentMessage", "AgentMessage"):
+        payload = item.get(key)
+        if isinstance(payload, dict):
+            return payload
+    return item
+
+
+def _agent_message_text(agent_message: dict[str, Any]) -> str | None:
+    text = agent_message.get("text")
+    if isinstance(text, str):
+        return text
+    for key in (
+        "structuredContent",
+        "structured_content",
+        "structuredOutput",
+        "structured_output",
+    ):
+        value = agent_message.get(key)
+        if value is not None:
+            return json.dumps(value, ensure_ascii=False)
+    return None
+
+
+def _turn_id_from_message(message: dict[str, Any]) -> str | None:
+    turn_id = _get_nested(message, "params", "turnId")
+    if isinstance(turn_id, str):
+        return turn_id
+    turn_id = _get_nested(message, "params", "turn", "id")
+    if isinstance(turn_id, str):
+        return turn_id
+    return None
+
+
+def _merge_app_server_items(
+    streamed_items: list[Any], completed_items: list[Any]
+) -> list[Any]:
+    if not streamed_items:
+        return completed_items
+    if not completed_items:
+        return streamed_items
+
+    merged = list(streamed_items)
+    id_to_index = {
+        item.get("id"): index
+        for index, item in enumerate(streamed_items)
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    for item in completed_items:
+        if isinstance(item, dict):
+            item_id = item.get("id")
+            if isinstance(item_id, str):
+                existing_index = id_to_index.get(item_id)
+                if existing_index is not None:
+                    merged[existing_index] = item
+                    continue
+                id_to_index[item_id] = len(merged)
+                merged.append(item)
+                continue
+        if item not in merged:
+            merged.append(item)
+    return merged
+
+
+def _is_final_answer_phase(phase: Any) -> bool:
+    if not isinstance(phase, str):
+        return False
+    return phase in {"final_answer", "finalAnswer", "FinalAnswer"}
+
+
+def _final_assistant_response_from_items(items: list[Any]) -> str:
+    last_unknown_phase_response: str | None = None
+
+    for item in reversed(items):
+        if not isinstance(item, dict) or _thread_item_type(item) != "agentMessage":
+            continue
+        agent_message = _agent_message_payload(item)
+        text = _agent_message_text(agent_message)
+        if text is None:
+            continue
+        phase = agent_message.get("phase")
+        if _is_final_answer_phase(phase):
+            return text.strip()
+        if phase is None and last_unknown_phase_response is None:
+            last_unknown_phase_response = text
+
+    return (last_unknown_phase_response or "").strip()
 
 
 def no_findings(response: str) -> bool:
@@ -1154,6 +1970,13 @@ def _coerce_int(value: Any) -> int | None:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return None
+
+
+def default_oracle_cwd() -> Path:
+    xdg_state_home = os.environ.get("XDG_STATE_HOME")
+    if xdg_state_home:
+        return Path(xdg_state_home) / "codex-super-review" / "oracle-workspace"
+    return Path.home() / ".local" / "state" / "codex-super-review" / "oracle-workspace"
 
 
 def parse_positive_int(value: str) -> int:
@@ -1231,6 +2054,7 @@ def build_parser() -> argparse.ArgumentParser:
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer-compact-threshold-percent 60
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log true
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer "gpt 5.5 medium" --reviewer "gpt 5.4 xhigh"
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --oracle "gpt 5.4 mini low"
 
 The command must be run from the project root to review. The provided implementer
 session must be resumable by `codex exec resume`, and this harness should be the
@@ -1300,6 +2124,25 @@ model_reasoning_effort="xhigh".""",
         "--reviewer-model",
         dest="reviewer_model",
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--oracle",
+        dest="oracle_model",
+        default=DEFAULT_ORACLE_MODEL,
+        metavar="MODEL EFFORT",
+        help=f'Oracle classifier model and reasoning effort. Default: "{DEFAULT_ORACLE_MODEL}".',
+    )
+    parser.add_argument(
+        "--oracle-model",
+        dest="oracle_model",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--max-oracle-retries",
+        type=parse_positive_int,
+        default=2,
+        metavar="N",
+        help="Maximum oracle parse-failure retries after rolling back malformed oracle turns. Default: 2.",
     )
     parser.add_argument(
         "--codex-bin",

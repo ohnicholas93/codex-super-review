@@ -70,11 +70,36 @@ Model arguments use `"<model> <reasoning_effort>"` or
 ```bash
 codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
   --implementer "gpt-5.5 medium" \
-  --reviewer "gpt-5.4 xhigh"
+  --reviewer "gpt-5.4 xhigh" \
+  --oracle "gpt-5.4-mini low"
 ```
 
 The implementer session should not be controlled by another process while this
 tool is running.
+
+## Rejected Finding Oracle
+
+Starting with the second fresh reviewer stream, `codex-super-review` asks a
+fresh oracle thread whether the new findings are only, partly, or not at all
+covered by the implementer's previous explicit rejection.
+
+If the oracle reports only previously rejected findings, the run terminates
+successfully with an audit reason. If it reports a mix of rejected and new
+findings, the reviewer rewrites the comments without the rejected findings. The
+sanitized comments are sent to the implementer when that rewrite succeeds. If
+the rewrite fails after its retry budget, the harness logs the failure and
+continues with the original reviewer comments. If removing rejected findings
+leaves no remaining findings, the run terminates successfully with an audit
+reason.
+
+Oracle output is parsed as strict JSON. On malformed oracle output, the harness
+uses Codex app-server `thread/rollback` to drop that failed oracle turn from
+oracle context and retries:
+
+```bash
+codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
+  --max-oracle-retries 2
+```
 
 ## Audit Logs
 
