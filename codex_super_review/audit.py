@@ -14,7 +14,7 @@ class AuditLogger:
         self,
         enabled: bool,
         cwd: Path,
-        implementer_thread_id: str,
+        implementer_thread_id: str | None,
         implementer_model: ModelSpec,
         reviewer_model: ModelSpec,
     ) -> None:
@@ -43,6 +43,9 @@ class AuditLogger:
             self.path = None
             self._file = None
             print(f"warning: audit logging disabled: {exc}", file=sys.stderr)
+
+    def set_implementer_thread_id(self, thread_id: str) -> None:
+        self.implementer_thread_id = thread_id
 
     def close(self) -> None:
         if self._file is not None:

@@ -24,18 +24,20 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Run iterative Codex reviewer streams against a persistent implementer Codex session.",
         epilog="""Examples:
+  codex-super-review
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-new-reviewer-streams 3
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-fix-rounds-per-reviewer 2
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer-compact-threshold-percent 60
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log true
-  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --branch-base release/2026.05
+  codex-super-review --branch-base release/2026.05
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer "gpt 5.5 medium" --reviewer "gpt 5.4 xhigh"
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --oracle "gpt 5.4 mini low"
 
-The command must be run from the project root to review. The provided implementer
-session must be resumable by `codex exec resume`, and this harness should be the
-only active controller of that session while it runs.
+The command must be run from the project root to review. If an implementer
+session ID is provided, it must be resumable by `codex exec resume`. If omitted,
+the first implementer fix round creates a fresh persistent session. This harness
+should be the only active controller of the implementer session while it runs.
 
 Model arguments are formatted as "<model> <reasoning_effort>" or
 "<model>:<reasoning_effort>". Spaces inside the model name are normalized to
@@ -44,7 +46,12 @@ model_reasoning_effort="xhigh".""",
     )
     parser.add_argument(
         "implementer_codex_session_id",
-        help="Existing Codex session/thread id for the persistent implementer stream.",
+        nargs="?",
+        default=None,
+        help=(
+            "Existing Codex session/thread id for the persistent implementer stream. "
+            "If omitted, a fresh implementer session is created on the first fix round."
+        ),
     )
     parser.add_argument(
         "--max-new-reviewer-streams",
@@ -83,9 +90,10 @@ model_reasoning_effort="xhigh".""",
         default=40.0,
         metavar="PERCENT",
         help=(
-            "Before the first fix round for each fresh reviewer stream, resume the implementer "
-            "through Codex app-server and compact if restored context usage is at or above this "
-            "percentage. Use 0 to disable. Default: 40."
+            "Before the first fix round for each fresh reviewer stream, check the implementer "
+            "thread through Codex app-server and compact if restored context usage is at or "
+            "above this percentage. Skipped until an implementer session exists. Use 0 to "
+            "disable. Default: 40."
         ),
     )
     parser.add_argument(

@@ -67,6 +67,7 @@ def orchestrate(args: argparse.Namespace) -> int:
     reviewer_prompt = PROMPT_REVIEW_CHANGES
     initial_fix_prompt = PROMPT_VALIDATE_FIX_COMMENTS
     followup_fix_prompt = PROMPT_VALIDATE_FOLLOWUP_COMMENTS
+    last_logged_implementer_thread_id = args.implementer_codex_session_id
 
     try:
         try:
@@ -86,6 +87,13 @@ def orchestrate(args: argparse.Namespace) -> int:
 
         if audit.path is not None:
             print(f"Audit log: {audit.path}", file=sys.stderr)
+        if implementer.thread_id is None:
+            print(
+                "Implementer session: a fresh session will be created on the first fix round",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Implementer session: {implementer.thread_id}", file=sys.stderr)
         print(
             f"Requested implementer model: {implementer_model.display}", file=sys.stderr
         )
@@ -316,7 +324,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                     precompact_result = maybe_compact_implementer_before_first_fix(
                         codex_bin=args.codex_bin,
                         cwd=cwd,
-                        implementer_thread_id=args.implementer_codex_session_id,
+                        implementer_thread_id=implementer.thread_id,
                         implementer_model=implementer_model,
                         threshold_percent=args.implementer_compact_threshold_percent,
                     )
@@ -340,6 +348,16 @@ def orchestrate(args: argparse.Namespace) -> int:
 
                 implementer_prompt = f"{current_prompt}\n\n{current_comments}"
                 fix_result = implementer.fix(implementer_prompt)
+                if (
+                    implementer.thread_id is not None
+                    and implementer.thread_id != last_logged_implementer_thread_id
+                ):
+                    last_logged_implementer_thread_id = implementer.thread_id
+                    audit.set_implementer_thread_id(implementer.thread_id)
+                    print(
+                        f"Implementer session: {implementer.thread_id}",
+                        file=sys.stderr,
+                    )
                 fix_errors, fix_diagnostics = _collect_problem_lines(fix_result)
                 if fix_errors or fix_diagnostics:
                     round_diagnostics.append(

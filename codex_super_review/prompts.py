@@ -22,7 +22,7 @@ NO_FINDINGS
 
 If you do find issues, do not include the string NO_FINDINGS anywhere in your response."""
 
-PROMPT_VALIDATE_FIX_COMMENTS = """Another developer wrote these comments regarding your changes (currently uncommitted in git). Please verify and check the correctness and applicability of their findings. If their concerns are valid and appropriate, please fix and address them.
+PROMPT_VALIDATE_FIX_COMMENTS = """Another developer wrote these comments about the currently uncommitted changes in git. Please verify and check the correctness and applicability of their findings. If their concerns are valid and appropriate, please fix and address them.
 
 Reject review comments that are out of scope for the current change, or would cause unrelated scope creep. Do not implement broad refactors, product changes, speculative hardening, or unrelated cleanup merely because a reviewer suggested them. If a review comment is invalid or out of scope, say so clearly and leave the code unchanged for that comment.
 

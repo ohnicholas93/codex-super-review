@@ -204,7 +204,7 @@ class CodexReviewer:
 
 class CodexImplementer:
     def __init__(
-        self, runner: CodexExecRunner, thread_id: str, model_spec: ModelSpec
+        self, runner: CodexExecRunner, thread_id: str | None, model_spec: ModelSpec
     ) -> None:
         self.runner = runner
         self.thread_id = thread_id
@@ -220,6 +220,7 @@ class CodexImplementer:
             approval_policy=IMPLEMENTER_APPROVAL_POLICY,
             approvals_reviewer=IMPLEMENTER_APPROVALS_REVIEWER,
         )
+        if result.thread_id is not None:
+            self.thread_id = result.thread_id
         return result
-
 

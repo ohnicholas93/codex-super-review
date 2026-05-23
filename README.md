@@ -1,6 +1,6 @@
 # codex-super-review
 
-`codex-super-review` runs iterative Codex review loops against an existing
+`codex-super-review` runs iterative Codex review loops against a persistent
 implementer Codex session. It starts fresh read-only reviewer streams, sends
 actionable findings back to the implementer session, and repeats until a fresh
 reviewer returns `NO_FINDINGS` or a configured round limit is reached.
@@ -14,8 +14,9 @@ especially across multiple reviewer streams and fix rounds. Use at your own risk
 
 - Python 3.10 or newer.
 - The `codex` CLI available on `PATH`.
-- A resumable Codex implementer session ID created in the repository you want
-  to review.
+- Optionally, a resumable Codex implementer session ID created in the
+  repository you want to review. If omitted, the first fix round creates a fresh
+  implementer session automatically.
 
 This project has no third-party Python dependencies.
 
@@ -41,6 +42,12 @@ To uninstall:
 Run the command from the project root you want Codex to review:
 
 ```bash
+codex-super-review
+```
+
+To resume an existing implementer session instead:
+
+```bash
 codex-super-review IMPLEMENTER_CODEX_SESSION_ID
 ```
 
@@ -49,7 +56,7 @@ changes. To review the currently checked out branch against a base branch
 instead, pass the explicit base ref:
 
 ```bash
-codex-super-review IMPLEMENTER_CODEX_SESSION_ID --branch-base origin/main
+codex-super-review --branch-base origin/main
 ```
 
 The branch review scope is pinned at startup: the tool resolves the base ref to
@@ -61,8 +68,7 @@ scope. The tool does not guess a base branch; if `--branch-base` is omitted,
 reviewers inspect only the current staged, unstaged, and untracked changes.
 
 ```bash
-codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
-  --branch-base release/2026.05
+codex-super-review --branch-base release/2026.05
 ```
 
 Useful limits for bounded runs:
@@ -76,7 +82,9 @@ codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
 Before the first fix round for each fresh reviewer stream, the tool checks the
 implementer thread's restored context usage through Codex app-server. If usage is
 at or above 40%, it triggers Codex's built-in compaction before sending the
-reviewer findings to the implementer:
+reviewer findings to the implementer. When no implementer session ID is
+provided, this check is skipped until the first implementer fix round creates
+the session:
 
 ```bash
 codex-super-review IMPLEMENTER_CODEX_SESSION_ID \

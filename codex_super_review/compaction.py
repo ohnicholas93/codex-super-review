@@ -12,7 +12,7 @@ def maybe_compact_implementer_before_first_fix(
     *,
     codex_bin: str,
     cwd: Path,
-    implementer_thread_id: str,
+    implementer_thread_id: str | None,
     implementer_model: ModelSpec,
     threshold_percent: float,
 ) -> PreCompactResult:
@@ -20,6 +20,11 @@ def maybe_compact_implementer_before_first_fix(
         return PreCompactResult(
             status="disabled",
             message="implementer pre-fix compaction disabled",
+        )
+    if implementer_thread_id is None:
+        return PreCompactResult(
+            status="skipped_no_thread",
+            message="skipped implementer pre-fix compaction: no implementer session exists yet",
         )
 
     with AppServerJsonRpcClient(codex_bin, cwd, implementer_model) as client:
