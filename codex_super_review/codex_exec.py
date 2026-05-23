@@ -5,18 +5,26 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .constants import IMPLEMENTER_APPROVALS_REVIEWER, IMPLEMENTER_APPROVAL_POLICY
 from .errors import CodexExecutableNotFound
+from .interrupts import GracefulInterruptController
 from .models import CodexResult, ModelSpec
 from .utils import _stringify_error
 
 class CodexExecRunner:
-    def __init__(self, codex_bin: str, cwd: Path) -> None:
+    def __init__(
+        self,
+        codex_bin: str,
+        cwd: Path,
+        interrupt_controller: GracefulInterruptController | None = None,
+    ) -> None:
         self.codex_bin = codex_bin
         self.cwd = cwd
+        self.interrupt_controller = interrupt_controller
 
     def run(
         self,
@@ -75,6 +83,11 @@ class CodexExecRunner:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **(
+                    self.interrupt_controller.subprocess_kwargs()
+                    if self.interrupt_controller is not None
+                    else {}
+                ),
             )
         except FileNotFoundError as exc:
             self._remove_temp_file(last_message_path)
@@ -92,53 +105,92 @@ class CodexExecRunner:
                 stdin_errors.append(
                     "codex process closed stdin before reading the full prompt"
                 )
+            except ValueError as exc:
+                stdin_errors.append(
+                    f"codex stdin closed before prompt write finished: {exc}"
+                )
             except OSError as exc:
                 stdin_errors.append(f"failed to write prompt to codex stdin: {exc}")
             finally:
                 try:
                     process.stdin.close()
-                except OSError:
+                except (OSError, ValueError):
                     pass
 
-        writer = threading.Thread(target=write_prompt, name="codex-stdin-writer")
-        writer.start()
+        writer: threading.Thread | None = None
+        returncode: int | None = None
+        try:
+            process_context = (
+                self.interrupt_controller.track_process(process)
+                if self.interrupt_controller is not None
+                else _null_process_context()
+            )
+            with process_context:
+                writer = threading.Thread(
+                    target=write_prompt,
+                    name="codex-stdin-writer",
+                    daemon=True,
+                )
+                writer.start()
 
-        assert process.stdout is not None
-        for raw_line in process.stdout:
-            line = raw_line.rstrip("\n")
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                diagnostics.append(line)
-                print(f"[{phase}] {line}", file=sys.stderr)
-                continue
-            if not isinstance(event, dict):
-                diagnostic = f"unexpected non-object JSON event: {line}"
-                diagnostics.append(diagnostic)
-                print(f"[{phase}] {diagnostic}", file=sys.stderr)
-                continue
+                assert process.stdout is not None
+                for raw_line in process.stdout:
+                    line = raw_line.rstrip("\n")
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        diagnostics.append(line)
+                        print(f"[{phase}] {line}", file=sys.stderr)
+                        continue
+                    if not isinstance(event, dict):
+                        diagnostic = f"unexpected non-object JSON event: {line}"
+                        diagnostics.append(diagnostic)
+                        print(f"[{phase}] {diagnostic}", file=sys.stderr)
+                        continue
 
-            event_type = event.get("type")
-            if isinstance(event_type, str):
-                event_types.append(event_type)
+                    event_type = event.get("type")
+                    if isinstance(event_type, str):
+                        event_types.append(event_type)
 
-            if event_type == "thread.started" and isinstance(
-                event.get("thread_id"), str
-            ):
-                thread_id = event["thread_id"]
-            elif event_type == "turn.completed" and isinstance(
-                event.get("usage"), dict
-            ):
-                usage = event["usage"]
-            elif event_type == "turn.failed":
-                errors.append(_stringify_error(event.get("error")))
-            elif event_type == "error":
-                errors.append(str(event.get("message", event)))
+                    if event_type == "thread.started" and isinstance(
+                        event.get("thread_id"), str
+                    ):
+                        thread_id = event["thread_id"]
+                    elif event_type == "turn.completed" and isinstance(
+                        event.get("usage"), dict
+                    ):
+                        usage = event["usage"]
+                    elif event_type == "turn.failed":
+                        errors.append(_stringify_error(event.get("error")))
+                    elif event_type == "error":
+                        errors.append(str(event.get("message", event)))
 
-        writer.join()
-        returncode = process.wait()
+                writer.join()
+                returncode = process.wait()
+        except BaseException:
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except (OSError, ValueError):
+                    pass
+            if self.interrupt_controller is not None:
+                self.interrupt_controller.terminate_process(process)
+            elif process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if writer is not None:
+                writer.join(timeout=1.0)
+            raise
+        finally:
+            if returncode is None:
+                self._remove_temp_file(last_message_path)
+
         diagnostics.extend(stdin_errors)
         response = ""
         try:
@@ -150,6 +202,7 @@ class CodexExecRunner:
         finally:
             self._remove_temp_file(last_message_path)
 
+        assert returncode is not None
         return CodexResult(
             command=command,
             returncode=returncode,
@@ -168,6 +221,10 @@ class CodexExecRunner:
         except FileNotFoundError:
             pass
 
+
+@contextmanager
+def _null_process_context() -> Iterator[None]:
+    yield
 
 
 class CodexReviewer:
@@ -223,4 +280,3 @@ class CodexImplementer:
         if result.thread_id is not None:
             self.thread_id = result.thread_id
         return result
-

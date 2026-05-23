@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .app_server import AppServerJsonRpcClient
 from .constants import CODEX_TUI_CONTEXT_BASELINE_TOKENS
+from .interrupts import GracefulInterruptController
 from .models import ModelSpec, PreCompactResult
 from .utils import _coerce_int, _get_nested
 
@@ -15,6 +16,7 @@ def maybe_compact_implementer_before_first_fix(
     implementer_thread_id: str | None,
     implementer_model: ModelSpec,
     threshold_percent: float,
+    interrupt_controller: GracefulInterruptController | None = None,
 ) -> PreCompactResult:
     if threshold_percent <= 0:
         return PreCompactResult(
@@ -27,7 +29,12 @@ def maybe_compact_implementer_before_first_fix(
             message="skipped implementer pre-fix compaction: no implementer session exists yet",
         )
 
-    with AppServerJsonRpcClient(codex_bin, cwd, implementer_model) as client:
+    with AppServerJsonRpcClient(
+        codex_bin,
+        cwd,
+        implementer_model,
+        interrupt_controller,
+    ) as client:
         token_usage = client.resume_thread_for_usage(implementer_thread_id)
         if token_usage is None:
             return PreCompactResult(

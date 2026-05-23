@@ -21,6 +21,7 @@ from .errors import (
     CodexRunFailure,
     LimitReached,
 )
+from .interrupts import GracefulInterruptController
 from .models import BranchReviewScope, RoundDiagnostics
 from .oracle import CodexOracle
 from .prompts import (
@@ -43,8 +44,9 @@ from .cli_parsers import parse_model_spec
 from .workflow_helpers import _has_round_remaining, no_findings
 
 def orchestrate(args: argparse.Namespace) -> int:
+    interrupt_controller = GracefulInterruptController()
     cwd = Path.cwd()
-    runner = CodexExecRunner(args.codex_bin, cwd)
+    runner = CodexExecRunner(args.codex_bin, cwd, interrupt_controller)
     implementer_model = parse_model_spec(args.implementer_model)
     reviewer_model = parse_model_spec(args.reviewer_model)
     oracle_model = parse_model_spec(args.oracle_model)
@@ -69,6 +71,7 @@ def orchestrate(args: argparse.Namespace) -> int:
     followup_fix_prompt = PROMPT_VALIDATE_FOLLOWUP_COMMENTS
     last_logged_implementer_thread_id = args.implementer_codex_session_id
 
+    interrupt_controller.__enter__()
     try:
         try:
             branch_scope = _prepare_branch_review_scope(cwd, args.branch_base, audit)
@@ -124,7 +127,29 @@ def orchestrate(args: argparse.Namespace) -> int:
 
         outer_round = 0
         while _has_round_remaining(outer_round, args.max_new_reviewer_streams):
+            if interrupt_controller.should_stop_before_next_reviewer():
+                audit.log(
+                    "interrupted_before_next_reviewer",
+                    review_round=outer_round,
+                    message="interrupt requested; stopped before starting the next reviewer stream",
+                )
+                print(
+                    "Stopped before starting the next reviewer stream",
+                    file=sys.stderr,
+                )
+                return 130
             outer_round += 1
+            if interrupt_controller.should_stop_before_next_reviewer():
+                audit.log(
+                    "interrupted_before_next_reviewer",
+                    review_round=outer_round,
+                    message="interrupt requested; stopped before starting the next reviewer stream",
+                )
+                print(
+                    "Stopped before starting the next reviewer stream",
+                    file=sys.stderr,
+                )
+                return 130
             print(f"Starting reviewer stream {outer_round}", file=sys.stderr)
 
             reviewer, review_result = _run_reviewer_review_with_retries(
@@ -163,7 +188,10 @@ def orchestrate(args: argparse.Namespace) -> int:
                     try:
                         oracle_cwd.mkdir(parents=True, exist_ok=True)
                         candidate_oracle_client = AppServerJsonRpcClient(
-                            args.codex_bin, oracle_cwd, oracle_model
+                            args.codex_bin,
+                            oracle_cwd,
+                            oracle_model,
+                            interrupt_controller,
                         )
                         candidate_oracle_client.__enter__()
                     except (
@@ -327,6 +355,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                         implementer_thread_id=implementer.thread_id,
                         implementer_model=implementer_model,
                         threshold_percent=args.implementer_compact_threshold_percent,
+                        interrupt_controller=interrupt_controller,
                     )
                     print(precompact_result.message, file=sys.stderr)
                     audit.log(
@@ -459,9 +488,12 @@ def orchestrate(args: argparse.Namespace) -> int:
 
         raise LimitReached("max new reviewer streams reached before convergence")
     finally:
-        if oracle_client is not None:
-            oracle_client.close()
-        audit.close()
+        try:
+            if oracle_client is not None:
+                oracle_client.close()
+            audit.close()
+        finally:
+            interrupt_controller.__exit__(None, None, None)
 
 
 def _reviewer_prompt(

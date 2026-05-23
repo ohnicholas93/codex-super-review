@@ -16,18 +16,27 @@ from .constants import (
     APP_SERVER_TOKEN_USAGE_TIMEOUT_SECONDS,
 )
 from .errors import CodexAppServerFailure, CodexExecutableNotFound
+from .interrupts import GracefulInterruptController
 from .models import AppServerTurnResult, ModelSpec
 from .utils import _get_nested
 
 class AppServerJsonRpcClient:
-    def __init__(self, codex_bin: str, cwd: Path, model_spec: ModelSpec) -> None:
+    def __init__(
+        self,
+        codex_bin: str,
+        cwd: Path,
+        model_spec: ModelSpec,
+        interrupt_controller: GracefulInterruptController | None = None,
+    ) -> None:
         self.codex_bin = codex_bin
         self.cwd = cwd
         self.model_spec = model_spec
+        self.interrupt_controller = interrupt_controller
         self._next_request_id = 1
         self._events: queue.Queue[dict[str, Any]] = queue.Queue()
         self._pending_messages: deque[dict[str, Any]] = deque()
         self._process: subprocess.Popen[str] | None = None
+        self._process_tracker: Any = None
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
 
@@ -48,11 +57,21 @@ class AppServerJsonRpcClient:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **(
+                    self.interrupt_controller.subprocess_kwargs()
+                    if self.interrupt_controller is not None
+                    else {}
+                ),
             )
         except FileNotFoundError as exc:
             raise CodexExecutableNotFound(
                 f"could not find Codex executable: {self.codex_bin}"
             ) from exc
+        if self.interrupt_controller is not None:
+            self._process_tracker = self.interrupt_controller.track_process(
+                self._process
+            )
+            self._process_tracker.__enter__()
 
         assert self._process.stdout is not None
         self._reader = threading.Thread(
@@ -70,7 +89,11 @@ class AppServerJsonRpcClient:
         )
         self._stderr_reader.start()
 
-        self._initialize()
+        try:
+            self._initialize()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
@@ -80,18 +103,25 @@ class AppServerJsonRpcClient:
         process = self._process
         if process is None:
             return
-        if process.stdin is not None:
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
         try:
-            process.terminate()
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except (OSError, ValueError):
+                    pass
+            if self.interrupt_controller is not None:
+                self.interrupt_controller.terminate_process(process)
+            else:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
         finally:
+            if self._process_tracker is not None:
+                self._process_tracker.__exit__(None, None, None)
+                self._process_tracker = None
             self._process = None
 
     def resume_thread_for_usage(self, thread_id: str) -> dict[str, Any] | None:
