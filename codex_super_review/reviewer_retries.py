@@ -8,7 +8,7 @@ from .codex_exec import CodexExecRunner, CodexReviewer
 from .constants import MAX_REVIEWER_TOOL_RETRIES
 from .diagnostics import _collect_problem_lines, _raise_for_result_problems, ensure_success
 from .errors import CodexResultDiagnostics, CodexRunFailure
-from .models import CodexResult, ModelSpec, RoundDiagnostics
+from .models import BranchReviewScope, CodexResult, ModelSpec, RoundDiagnostics
 from .prompts import build_reverify_retry_prompt, build_rewrite_without_rejected_prompt
 from .workflow_helpers import no_findings
 
@@ -79,9 +79,7 @@ def _run_reviewer_reverify_with_retries(
     *,
     review_round: int,
     fix_round: int,
-    branch_base: str | None,
-    branch_base_commit: str | None,
-    merge_base: str | None,
+    branch_scope: BranchReviewScope | None,
     audit: AuditLogger,
     round_diagnostics: list[RoundDiagnostics],
     branch_scope_guard: Callable[[str | None], None] | None = None,
@@ -94,9 +92,11 @@ def _run_reviewer_reverify_with_retries(
             retry_prompt = build_reverify_retry_prompt(
                 reviewer_comments,
                 developer_response,
-                branch_base=branch_base,
-                branch_base_commit=branch_base_commit,
-                merge_base=merge_base,
+                branch_base=branch_scope.base_ref if branch_scope else None,
+                branch_base_commit=branch_scope.base_commit
+                if branch_scope
+                else None,
+                merge_base=branch_scope.merge_base if branch_scope else None,
             )
             result = current_reviewer.review(retry_prompt)
         else:

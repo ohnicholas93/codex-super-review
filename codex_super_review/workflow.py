@@ -21,7 +21,7 @@ from .errors import (
     CodexRunFailure,
     LimitReached,
 )
-from .models import RoundDiagnostics
+from .models import BranchReviewScope, RoundDiagnostics
 from .oracle import CodexOracle
 from .prompts import (
     PROMPT_REVIEW_BRANCH,
@@ -63,43 +63,17 @@ def orchestrate(args: argparse.Namespace) -> int:
     )
     round_diagnostics: list[RoundDiagnostics] = []
     implementer_responses: list[str] = []
-    branch_base: str | None = None
-    branch_base_commit: str | None = None
-    branch_head_commit: str | None = None
-    branch_head_ref: str | None = None
-    branch_head_reflog_state: str | None = None
-    merge_base: str | None = None
+    branch_scope: BranchReviewScope | None = None
     reviewer_prompt = PROMPT_REVIEW_CHANGES
     initial_fix_prompt = PROMPT_VALIDATE_FIX_COMMENTS
     followup_fix_prompt = PROMPT_VALIDATE_FOLLOWUP_COMMENTS
 
     try:
         try:
-            branch_base = _validate_branch_base(cwd, args.branch_base)
-            if branch_base is not None:
-                _ensure_clean_worktree_for_branch_review(cwd)
-                branch_base_commit = _resolve_ref_commit(cwd, branch_base)
-                branch_head_commit = _resolve_head_commit(cwd)
-                branch_head_ref = _resolve_head_ref(cwd)
-                branch_head_reflog_state = _resolve_head_reflog_state(cwd)
-                if branch_head_reflog_state is None:
-                    audit.log(
-                        "branch_reflog_guard_unavailable",
-                        message=(
-                            "HEAD reflog state is unavailable; branch scope will "
-                            "enforce final HEAD commit/ref only"
-                        ),
-                    )
-                merge_base = _resolve_merge_base(cwd, branch_base_commit)
-            reviewer_prompt = _reviewer_prompt(
-                branch_base, branch_base_commit, merge_base
-            )
-            initial_fix_prompt = _initial_fix_prompt(
-                branch_base, branch_base_commit, merge_base
-            )
-            followup_fix_prompt = _followup_fix_prompt(
-                branch_base, branch_base_commit, merge_base
-            )
+            branch_scope = _prepare_branch_review_scope(cwd, args.branch_base, audit)
+            reviewer_prompt = _reviewer_prompt(branch_scope)
+            initial_fix_prompt = _initial_fix_prompt(branch_scope)
+            followup_fix_prompt = _followup_fix_prompt(branch_scope)
         except RuntimeError as exc:
             audit.log(
                 "branch_preflight_failed",
@@ -126,22 +100,18 @@ def orchestrate(args: argparse.Namespace) -> int:
         print(f"Requested reviewer model: {reviewer_model.display}", file=sys.stderr)
         print(f"Requested oracle model: {oracle_model.display}", file=sys.stderr)
         print(
-            f"Review scope: {'branch' if branch_base is not None else 'changes'}",
+            f"Review scope: {'branch' if branch_scope is not None else 'changes'}",
             file=sys.stderr,
         )
-        if branch_base is not None:
-            print(f"Branch base: {branch_base}", file=sys.stderr)
-        if branch_base_commit is not None:
-            print(f"Branch base commit: {branch_base_commit}", file=sys.stderr)
-        if branch_head_commit is not None:
-            print(f"Branch HEAD commit: {branch_head_commit}", file=sys.stderr)
-        if branch_base is not None:
+        if branch_scope is not None:
+            print(f"Branch base: {branch_scope.base_ref}", file=sys.stderr)
+            print(f"Branch base commit: {branch_scope.base_commit}", file=sys.stderr)
+            print(f"Branch HEAD commit: {branch_scope.head_commit}", file=sys.stderr)
             print(
-                f"Branch HEAD ref: {branch_head_ref or '(detached)'}",
+                f"Branch HEAD ref: {branch_scope.head_ref or '(detached)'}",
                 file=sys.stderr,
             )
-        if merge_base is not None:
-            print(f"Merge base: {merge_base}", file=sys.stderr)
+            print(f"Merge base: {branch_scope.merge_base}", file=sys.stderr)
         print(f"Oracle workspace: {oracle_cwd}", file=sys.stderr)
 
         outer_round = 0
@@ -157,9 +127,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                 audit=audit,
                 branch_scope_guard=lambda reviewer_thread_id: _ensure_branch_scope_refs_unchanged(
                     cwd,
-                    branch_head_commit,
-                    branch_head_ref,
-                    branch_head_reflog_state,
+                    branch_scope,
                     audit=audit,
                     review_round=outer_round,
                     fix_round=None,
@@ -284,9 +252,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                                     round_diagnostics=round_diagnostics,
                                     branch_scope_guard=lambda reviewer_thread_id: _ensure_branch_scope_refs_unchanged(
                                         cwd,
-                                        branch_head_commit,
-                                        branch_head_ref,
-                                        branch_head_reflog_state,
+                                        branch_scope,
                                         audit=audit,
                                         review_round=outer_round,
                                         fix_round=None,
@@ -400,9 +366,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                     try:
                         _ensure_branch_scope_refs_unchanged(
                             cwd,
-                            branch_head_commit,
-                            branch_head_ref,
-                            branch_head_reflog_state,
+                            branch_scope,
                             audit=audit,
                             review_round=outer_round,
                             fix_round=fix_round,
@@ -416,9 +380,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                 else:
                     _ensure_branch_scope_refs_unchanged(
                         cwd,
-                        branch_head_commit,
-                        branch_head_ref,
-                        branch_head_reflog_state,
+                        branch_scope,
                         audit=audit,
                         review_round=outer_round,
                         fix_round=fix_round,
@@ -428,9 +390,7 @@ def orchestrate(args: argparse.Namespace) -> int:
 
                 reverify_prompt = _reverify_prompt(
                     fix_result.response,
-                    branch_base,
-                    branch_base_commit,
-                    merge_base,
+                    branch_scope,
                 )
                 reviewer, reverify_result = _run_reviewer_reverify_with_retries(
                     runner,
@@ -441,16 +401,12 @@ def orchestrate(args: argparse.Namespace) -> int:
                     fix_result.response,
                     review_round=outer_round,
                     fix_round=fix_round,
-                    branch_base=branch_base,
-                    branch_base_commit=branch_base_commit,
-                    merge_base=merge_base,
+                    branch_scope=branch_scope,
                     audit=audit,
                     round_diagnostics=round_diagnostics,
                     branch_scope_guard=lambda reviewer_thread_id: _ensure_branch_scope_refs_unchanged(
                         cwd,
-                        branch_head_commit,
-                        branch_head_ref,
-                        branch_head_reflog_state,
+                        branch_scope,
                         audit=audit,
                         review_round=outer_round,
                         fix_round=fix_round,
@@ -491,76 +447,89 @@ def orchestrate(args: argparse.Namespace) -> int:
 
 
 def _reviewer_prompt(
-    branch_base: str | None,
-    branch_base_commit: str | None,
-    merge_base: str | None,
+    branch_scope: BranchReviewScope | None,
 ) -> str:
-    if branch_base is not None:
+    if branch_scope is not None:
         return format_prompt(
             PROMPT_REVIEW_BRANCH,
-            branch_base=branch_base,
-            branch_base_commit=branch_base_commit,
-            merge_base=merge_base,
+            branch_base=branch_scope.base_ref,
+            branch_base_commit=branch_scope.base_commit,
+            merge_base=branch_scope.merge_base,
         )
     return PROMPT_REVIEW_CHANGES
 
 
 def _initial_fix_prompt(
-    branch_base: str | None,
-    branch_base_commit: str | None,
-    merge_base: str | None,
+    branch_scope: BranchReviewScope | None,
 ) -> str:
-    if branch_base is not None:
+    if branch_scope is not None:
         return format_prompt(
             PROMPT_VALIDATE_BRANCH_FIX_COMMENTS,
-            branch_base=branch_base,
-            branch_base_commit=branch_base_commit,
-            merge_base=merge_base,
+            branch_base=branch_scope.base_ref,
+            branch_base_commit=branch_scope.base_commit,
+            merge_base=branch_scope.merge_base,
         )
     return PROMPT_VALIDATE_FIX_COMMENTS
 
 
 def _followup_fix_prompt(
-    branch_base: str | None,
-    branch_base_commit: str | None,
-    merge_base: str | None,
+    branch_scope: BranchReviewScope | None,
 ) -> str:
-    if branch_base is not None:
+    if branch_scope is not None:
         return format_prompt(
             PROMPT_VALIDATE_BRANCH_FOLLOWUP_COMMENTS,
-            branch_base=branch_base,
-            branch_base_commit=branch_base_commit,
-            merge_base=merge_base,
+            branch_base=branch_scope.base_ref,
+            branch_base_commit=branch_scope.base_commit,
+            merge_base=branch_scope.merge_base,
         )
     return PROMPT_VALIDATE_FOLLOWUP_COMMENTS
 
 
 def _reverify_prompt(
     developer_response: str,
-    branch_base: str | None,
-    branch_base_commit: str | None,
-    merge_base: str | None,
+    branch_scope: BranchReviewScope | None,
 ) -> str:
-    if branch_base is not None:
-        if branch_base_commit is None:
-            raise ValueError("branch_base_commit is required for branch review prompt")
-        if merge_base is None:
-            raise ValueError("merge_base is required for branch review prompt")
+    if branch_scope is not None:
         return build_branch_reverify_prompt(
             developer_response,
-            base_branch=branch_base,
-            base_commit=branch_base_commit,
-            merge_base=merge_base,
+            base_branch=branch_scope.base_ref,
+            base_commit=branch_scope.base_commit,
+            merge_base=branch_scope.merge_base,
         )
     return build_reverify_prompt(developer_response)
 
 
-def _validate_branch_base(cwd: Path, branch_base: str | None) -> str | None:
+def _prepare_branch_review_scope(
+    cwd: Path,
+    branch_base: str | None,
+    audit: AuditLogger,
+) -> BranchReviewScope | None:
     if branch_base is None:
         return None
     if not _git_output(cwd, "rev-parse", "--verify", "--quiet", branch_base):
         raise RuntimeError(f"branch base does not exist: {branch_base}")
-    return branch_base
+    _ensure_clean_worktree_for_branch_review(cwd)
+    base_commit = _resolve_ref_commit(cwd, branch_base)
+    head_commit = _resolve_head_commit(cwd)
+    head_ref = _resolve_head_ref(cwd)
+    head_reflog_state = _resolve_head_reflog_state(cwd)
+    if head_reflog_state is None:
+        audit.log(
+            "branch_reflog_guard_unavailable",
+            message=(
+                "HEAD reflog state is unavailable; branch scope will enforce "
+                "final HEAD commit/ref only"
+            ),
+        )
+    merge_base = _resolve_merge_base(cwd, base_commit)
+    return BranchReviewScope(
+        base_ref=branch_base,
+        base_commit=base_commit,
+        head_commit=head_commit,
+        head_ref=head_ref,
+        head_reflog_state=head_reflog_state,
+        merge_base=merge_base,
+    )
 
 
 def _ensure_clean_worktree_for_branch_review(cwd: Path) -> None:
@@ -619,37 +588,35 @@ def _resolve_head_reflog_state(cwd: Path) -> str | None:
 
 def _ensure_branch_scope_refs_unchanged(
     cwd: Path,
-    expected_head_commit: str | None,
-    expected_head_ref: str | None,
-    expected_head_reflog_state: str | None,
+    branch_scope: BranchReviewScope | None,
     *,
     audit: AuditLogger,
     review_round: int,
     fix_round: int | None,
     reviewer_thread_id: str | None,
 ) -> None:
-    if expected_head_commit is None:
+    if branch_scope is None:
         return
     current_head_commit = _resolve_head_commit(cwd)
     current_head_ref = _resolve_head_ref(cwd)
     current_head_reflog_state = (
         _resolve_head_reflog_state(cwd)
-        if expected_head_reflog_state is not None
+        if branch_scope.head_reflog_state is not None
         else None
     )
     if (
-        current_head_commit == expected_head_commit
-        and current_head_ref == expected_head_ref
-        and current_head_reflog_state == expected_head_reflog_state
+        current_head_commit == branch_scope.head_commit
+        and current_head_ref == branch_scope.head_ref
+        and current_head_reflog_state == branch_scope.head_reflog_state
     ):
         return
     if (
-        current_head_commit != expected_head_commit
-        or current_head_ref != expected_head_ref
+        current_head_commit != branch_scope.head_commit
+        or current_head_ref != branch_scope.head_ref
     ):
         message = (
             "branch-scoped review cannot continue because HEAD changed from "
-            f"{expected_head_ref or '(detached)'}@{expected_head_commit} "
+            f"{branch_scope.head_ref or '(detached)'}@{branch_scope.head_commit} "
             f"to {current_head_ref or '(detached)'}@{current_head_commit}"
         )
         audit.log(
@@ -659,16 +626,16 @@ def _ensure_branch_scope_refs_unchanged(
             reviewer_thread_id=reviewer_thread_id,
             message=message,
             extra={
-                "expected_head_commit": expected_head_commit,
+                "expected_head_commit": branch_scope.head_commit,
                 "current_head_commit": current_head_commit,
-                "expected_head_ref": expected_head_ref,
+                "expected_head_ref": branch_scope.head_ref,
                 "current_head_ref": current_head_ref,
-                "expected_head_reflog_state": expected_head_reflog_state,
+                "expected_head_reflog_state": branch_scope.head_reflog_state,
                 "current_head_reflog_state": current_head_reflog_state,
             },
         )
         raise RuntimeError(message)
-    if current_head_reflog_state != expected_head_reflog_state:
+    if current_head_reflog_state != branch_scope.head_reflog_state:
         message = (
             "branch-scoped review cannot continue because HEAD reflog changed "
             "during the branch-scoped run"
@@ -680,11 +647,11 @@ def _ensure_branch_scope_refs_unchanged(
             reviewer_thread_id=reviewer_thread_id,
             message=message,
             extra={
-                "expected_head_commit": expected_head_commit,
+                "expected_head_commit": branch_scope.head_commit,
                 "current_head_commit": current_head_commit,
-                "expected_head_ref": expected_head_ref,
+                "expected_head_ref": branch_scope.head_ref,
                 "current_head_ref": current_head_ref,
-                "expected_head_reflog_state": expected_head_reflog_state,
+                "expected_head_reflog_state": branch_scope.head_reflog_state,
                 "current_head_reflog_state": current_head_reflog_state,
             },
         )

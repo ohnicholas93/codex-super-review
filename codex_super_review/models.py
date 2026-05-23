@@ -24,6 +24,18 @@ class ModelSpec:
     @property
     def display(self) -> str:
         return f"{self.model} {self.reasoning_effort}"
+
+
+@dataclass(frozen=True)
+class BranchReviewScope:
+    base_ref: str
+    base_commit: str
+    head_commit: str
+    head_ref: str | None
+    head_reflog_state: str | None
+    merge_base: str
+
+
 @dataclass
 class RoundDiagnostics:
     phase: str
