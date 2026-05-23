@@ -44,6 +44,27 @@ Run the command from the project root you want Codex to review:
 codex-super-review IMPLEMENTER_CODEX_SESSION_ID
 ```
 
+By default, reviewers inspect the current staged, unstaged, and untracked
+changes. To review the currently checked out branch against a base branch
+instead, pass the explicit base ref:
+
+```bash
+codex-super-review IMPLEMENTER_CODEX_SESSION_ID --branch-base origin/main
+```
+
+The branch review scope is pinned at startup: the tool resolves the base ref to
+its current commit, computes the merge base, and reviews the committed branch
+diff equivalent to `git diff BASE_COMMIT...HEAD`, plus any staged, unstaged, and
+untracked repair edits created during the run. Branch-scoped review requires a
+clean worktree at startup so pre-existing local edits do not enter the review
+scope. The tool does not guess a base branch; if `--branch-base` is omitted,
+reviewers inspect only the current staged, unstaged, and untracked changes.
+
+```bash
+codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
+  --branch-base release/2026.05
+```
+
 Useful limits for bounded runs:
 
 ```bash

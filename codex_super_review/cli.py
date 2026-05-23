@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-fix-rounds-per-reviewer 2
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer-compact-threshold-percent 60
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log true
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --branch-base release/2026.05
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer "gpt 5.5 medium" --reviewer "gpt 5.4 xhigh"
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --oracle "gpt 5.4 mini low"
 
@@ -65,6 +66,16 @@ model_reasoning_effort="xhigh".""",
         default=True,
         metavar="true|false",
         help="Write JSONL audit logs containing prompts, responses, diagnostics, and usage. Default: true.",
+    )
+    parser.add_argument(
+        "--branch-base",
+        dest="branch_base",
+        default=None,
+        metavar="REF",
+        help=(
+            "Review the currently checked out branch against this explicit base ref. "
+            "If omitted, reviewers inspect staged, unstaged, and untracked changes."
+        ),
     )
     parser.add_argument(
         "--implementer-compact-threshold-percent",

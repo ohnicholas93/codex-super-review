@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 
 from .audit import AuditLogger
 from .codex_exec import CodexExecRunner, CodexReviewer
@@ -18,6 +19,7 @@ def _run_reviewer_review_with_retries(
     *,
     review_round: int,
     audit: AuditLogger,
+    branch_scope_guard: Callable[[str | None], None] | None = None,
 ) -> tuple[CodexReviewer, CodexResult]:
     attempt = 0
     while True:
@@ -38,8 +40,17 @@ def _run_reviewer_review_with_retries(
             )
             if reviewer.thread_id is None:
                 raise RuntimeError("reviewer did not emit a thread id")
+            if branch_scope_guard is not None:
+                branch_scope_guard(reviewer.thread_id)
             return reviewer, result
         except (CodexRunFailure, CodexResultDiagnostics) as exc:
+            if branch_scope_guard is not None:
+                _raise_branch_scope_violation_after_failure(
+                    branch_scope_guard,
+                    reviewer.thread_id,
+                    "reviewer initial review",
+                    exc,
+                )
             if attempt >= MAX_REVIEWER_TOOL_RETRIES:
                 raise exc
             attempt += 1
@@ -68,8 +79,12 @@ def _run_reviewer_reverify_with_retries(
     *,
     review_round: int,
     fix_round: int,
+    branch_base: str | None,
+    branch_base_commit: str | None,
+    merge_base: str | None,
     audit: AuditLogger,
     round_diagnostics: list[RoundDiagnostics],
+    branch_scope_guard: Callable[[str | None], None] | None = None,
 ) -> tuple[CodexReviewer, CodexResult]:
     attempt = 0
     current_reviewer = reviewer
@@ -77,7 +92,11 @@ def _run_reviewer_reverify_with_retries(
         if attempt > 0:
             current_reviewer = CodexReviewer(runner, reviewer_model)
             retry_prompt = build_reverify_retry_prompt(
-                reviewer_comments, developer_response
+                reviewer_comments,
+                developer_response,
+                branch_base=branch_base,
+                branch_base_commit=branch_base_commit,
+                merge_base=merge_base,
             )
             result = current_reviewer.review(retry_prompt)
         else:
@@ -110,8 +129,17 @@ def _run_reviewer_reverify_with_retries(
             )
             if current_reviewer.thread_id is None:
                 raise RuntimeError("reviewer did not emit a thread id")
+            if branch_scope_guard is not None:
+                branch_scope_guard(current_reviewer.thread_id)
             return current_reviewer, result
         except (CodexRunFailure, CodexResultDiagnostics) as exc:
+            if branch_scope_guard is not None:
+                _raise_branch_scope_violation_after_failure(
+                    branch_scope_guard,
+                    current_reviewer.thread_id,
+                    "reviewer reverification",
+                    exc,
+                )
             if attempt >= MAX_REVIEWER_TOOL_RETRIES:
                 raise exc
             attempt += 1
@@ -142,6 +170,7 @@ def _run_reviewer_rewrite_without_rejected_with_retries(
     review_round: int,
     audit: AuditLogger,
     round_diagnostics: list[RoundDiagnostics],
+    branch_scope_guard: Callable[[str | None], None] | None = None,
 ) -> tuple[CodexReviewer, CodexResult]:
     attempt = 0
     while True:
@@ -187,6 +216,8 @@ def _run_reviewer_rewrite_without_rejected_with_retries(
             )
             if current_reviewer.thread_id is None:
                 raise RuntimeError("reviewer did not emit a thread id")
+            if branch_scope_guard is not None:
+                branch_scope_guard(current_reviewer.thread_id)
             if no_findings(result.response):
                 audit.log(
                     "complete_rewrite_without_rejected_findings",
@@ -205,6 +236,13 @@ def _run_reviewer_rewrite_without_rejected_with_retries(
                 )
             return current_reviewer, result
         except (CodexRunFailure, CodexResultDiagnostics) as exc:
+            if branch_scope_guard is not None:
+                _raise_branch_scope_violation_after_failure(
+                    branch_scope_guard,
+                    current_reviewer.thread_id,
+                    "reviewer rewrite without rejected findings",
+                    exc,
+                )
             if attempt >= MAX_REVIEWER_TOOL_RETRIES:
                 raise exc
             attempt += 1
@@ -225,3 +263,16 @@ def _run_reviewer_rewrite_without_rejected_with_retries(
                 },
             )
 
+
+def _raise_branch_scope_violation_after_failure(
+    branch_scope_guard: Callable[[str | None], None],
+    reviewer_thread_id: str | None,
+    phase: str,
+    original_exc: CodexRunFailure | CodexResultDiagnostics,
+) -> None:
+    try:
+        branch_scope_guard(reviewer_thread_id)
+    except RuntimeError as guard_exc:
+        raise RuntimeError(
+            f"{guard_exc}; original {phase} failure was preserved as the cause"
+        ) from original_exc
