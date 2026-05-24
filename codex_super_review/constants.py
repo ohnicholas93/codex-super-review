@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-DEFAULT_IMPLEMENTER_MODEL = "gpt-5.4 high"
+DEFAULT_IMPLEMENTER_MODEL = "gpt-5.5 low"
 DEFAULT_REVIEWER_MODEL = "gpt-5.4 medium"
 DEFAULT_ORACLE_MODEL = "gpt-5.4-mini low"
 IMPLEMENTER_APPROVALS_REVIEWER = "auto_review"

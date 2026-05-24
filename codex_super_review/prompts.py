@@ -4,7 +4,7 @@ import json
 
 from .constants import ORACLE_STATUSES
 
-PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings. Try to be comprehensive and precise so as to not require unnecessarily frequent back-and-forths with the developer.
+PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings. Infer the intended change scope from the diff and surrounding context, and use it to keep findings focused on issues reasonably connected to the change. Avoid drifting into highly unrelated pre-existing issues, broad refactors, or excessive  speculative hardening. Try to be comprehensive and precise so as to not require unnecessarily frequent back-and-forths with the developer.
 
 If you find no actionable issues, your final response must be exactly:
 
@@ -12,7 +12,7 @@ NO_FINDINGS
 
 If you do find issues, do not include the string NO_FINDINGS anywhere in your response."""
 
-PROMPT_REVIEW_BRANCH = """Review the currently checked out branch against the pinned base commit {base_commit} from {base_branch} and provide prioritized findings. Use the merge-base comparison from {merge_base} to the current working tree. This includes the committed branch diff equivalent to `git diff {base_commit}...HEAD`, plus staged, unstaged, and untracked repair edits created during this run.
+PROMPT_REVIEW_BRANCH = """Review the currently checked out branch against the pinned base commit {base_commit} from {base_branch} and provide prioritized findings. Use the merge-base comparison from {merge_base} to the current working tree. This includes the committed branch diff equivalent to `git diff {base_commit}...HEAD`, plus staged, unstaged, and untracked repair edits created during this run. Infer the intended change scope from the diff and surrounding context, and use it to keep findings focused on issues reasonably connected to the branch. Avoid drifting into highly unrelated pre-existing issues, broad refactors, or excessive speculative hardening.
 
 Do not change HEAD during this review. Do not create commits, amend commits, rebase, merge, reset HEAD, or check out another branch.
 
@@ -36,7 +36,7 @@ Reject review comments that are out of scope for the branch diff against {base_b
 
 If some command fails due to permission issues, retry it with escalation. If harmless, an oracle will approve it."""
 
-PROMPT_REVERIFY_FIXES = """Can you recheck now if all concerns have been successfully fixed, and if any other issues persist or cropped up since?
+PROMPT_REVERIFY_FIXES = """Can you recheck now if all concerns have been successfully fixed, and if any other issues persist or cropped up since? Keep the intended change scope in mind and avoid drifting into unrelated pre-existing issues, broad refactors, or speculative hardening.
 
 If all concerns are resolved and you find no actionable issues, your final response must be exactly:
 
