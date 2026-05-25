@@ -70,6 +70,8 @@ Do not judge whether the developer was correct. Trust the developer. Only classi
 
 The persistent oracle conversation receives developer responses in chronological order, one response per classification turn. A later response supersedes earlier responses for the same finding. If the developer later accepts, fixes, or otherwise withdraws an earlier rejection for the same issue, do not treat that earlier rejection as covering the current finding.
 
+Evaluate each current finding independently. Do not classify the whole review as NO_REJECTED_FINDINGS just because some current findings are new, valid, accepted, fixed, or unrelated to a prior rejection. If any current finding is clearly covered by an explicit rejection and any other current finding is not, classify as HAS_REJECTED_AND_NEW_FINDINGS.
+
 Return JSON only, with this exact shape:
 
 {
@@ -82,6 +84,8 @@ Rules:
 - Use HAS_REJECTED_AND_NEW_FINDINGS when at least one current finding is clearly covered by explicit developer rejection and at least one current finding is not.
 - Use NO_REJECTED_FINDINGS when no current finding is clearly covered by explicit developer rejection, or when the latest developer response and prior oracle conversation contain no explicit rejection.
 - When responses conflict for the same finding, classify using the latest applicable developer response.
+- A later acceptance or fix for one finding does not withdraw an earlier rejection of a different finding.
+- Mixed outcomes must never be collapsed to NO_REJECTED_FINDINGS: one repeated rejected finding plus one new finding is HAS_REJECTED_AND_NEW_FINDINGS.
 - explanation must always exist and must come before status in the JSON object.
 - For ONLY_REJECTED_FINDINGS and HAS_REJECTED_AND_NEW_FINDINGS, explanation must identify which current findings were previously rejected and why.
 - For NO_REJECTED_FINDINGS, explanation must briefly explain why no current finding is clearly covered by prior explicit rejection."""

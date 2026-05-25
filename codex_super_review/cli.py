@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log true
   codex-super-review --branch-base release/2026.05
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer "gpt 5.5 medium" --reviewer "gpt 5.4 xhigh"
-  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --oracle "gpt 5.4 mini low"
+  codex-super-review IMPLEMENTER_CODEX_SESSION_ID --oracle "gpt 5.4 mini medium"
 
 The command must be run from the project root to review. If an implementer
 session ID is provided, it must be resumable by `codex exec resume`. If omitted,

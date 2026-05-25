@@ -100,7 +100,7 @@ Model arguments use `"<model> <reasoning_effort>"` or
 codex-super-review IMPLEMENTER_CODEX_SESSION_ID \
   --implementer "gpt-5.5 medium" \
   --reviewer "gpt-5.4 xhigh" \
-  --oracle "gpt-5.4-mini low"
+  --oracle "gpt-5.4-mini medium"
 ```
 
 The implementer session should not be controlled by another process while this
