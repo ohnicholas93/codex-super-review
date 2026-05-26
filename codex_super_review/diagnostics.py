@@ -24,16 +24,22 @@ def _round_diagnostics_summary(entry: RoundDiagnostics) -> str:
     return ", ".join(parts)
 
 
-def _print_round_diagnostics(entries: list[RoundDiagnostics]) -> None:
+def round_diagnostics_lines(entries: list[RoundDiagnostics]) -> list[str]:
     if not entries:
-        return
-    print("Round diagnostics:", file=sys.stderr)
+        return []
+    lines = ["Round diagnostics:"]
     for entry in entries:
-        print(f"  {_round_diagnostics_summary(entry)}", file=sys.stderr)
+        lines.append(f"  {_round_diagnostics_summary(entry)}")
         for error in entry.errors[-3:]:
-            print(f"    error: {error}", file=sys.stderr)
+            lines.append(f"    error: {error}")
         for line in entry.diagnostics[-3:]:
-            print(f"    diagnostic: {line}", file=sys.stderr)
+            lines.append(f"    diagnostic: {line}")
+    return lines
+
+
+def _print_round_diagnostics(entries: list[RoundDiagnostics]) -> None:
+    for line in round_diagnostics_lines(entries):
+        print(line, file=sys.stderr)
 
 
 
@@ -55,11 +61,18 @@ def ensure_success(phase: str, result: CodexResult) -> None:
 
 
 def _print_failure_details(result: CodexResult) -> None:
+    for line in failure_details_lines(result):
+        print(line, file=sys.stderr)
+
+
+def failure_details_lines(result: CodexResult) -> list[str]:
+    lines: list[str] = []
     if result.errors:
-        print("Codex errors:", file=sys.stderr)
+        lines.append("Codex errors:")
         for error in result.errors:
-            print(f"  {error}", file=sys.stderr)
+            lines.append(f"  {error}")
     if result.diagnostics:
-        print("Diagnostics:", file=sys.stderr)
+        lines.append("Diagnostics:")
         for line in result.diagnostics[-20:]:
-            print(f"  {line}", file=sys.stderr)
+            lines.append(f"  {line}")
+    return lines

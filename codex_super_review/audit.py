@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .event_sink import NullEventSink
 from .models import CodexResult, ModelSpec
 
 class AuditLogger:
@@ -17,12 +17,14 @@ class AuditLogger:
         implementer_thread_id: str | None,
         implementer_model: ModelSpec,
         reviewer_model: ModelSpec,
+        event_sink: Any | None = None,
     ) -> None:
         self.enabled = enabled
         self.cwd = str(cwd)
         self.implementer_thread_id = implementer_thread_id
         self.implementer_model = implementer_model
         self.reviewer_model = reviewer_model
+        self.event_sink = event_sink if event_sink is not None else NullEventSink()
         self.path: Path | None = None
         self._file = None
         self._failure_warned = False
@@ -42,7 +44,7 @@ class AuditLogger:
             self.enabled = False
             self.path = None
             self._file = None
-            print(f"warning: audit logging disabled: {exc}", file=sys.stderr)
+            self.status(f"warning: audit logging disabled: {exc}")
 
     def set_implementer_thread_id(self, thread_id: str) -> None:
         self.implementer_thread_id = thread_id
@@ -51,6 +53,24 @@ class AuditLogger:
         if self._file is not None:
             self._file.close()
             self._file = None
+
+    def status(self, message: str) -> None:
+        self.event_sink.status(message)
+
+    def start(
+        self,
+        event: str,
+        *,
+        review_round: int | None = None,
+        fix_round: int | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.event_sink.start(
+            event,
+            review_round=review_round,
+            fix_round=fix_round,
+            message=message,
+        )
 
     def log(
         self,
@@ -65,9 +85,6 @@ class AuditLogger:
         message: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
-        if not self.enabled or self._file is None:
-            return
-
         record: dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event": event,
@@ -91,19 +108,18 @@ class AuditLogger:
         }
         if extra is not None:
             record["extra"] = extra
-        try:
-            self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            self._file.flush()
-        except OSError as exc:
-            self._disable_after_failure(exc)
+        if self.enabled and self._file is not None:
+            try:
+                self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                self._file.flush()
+            except OSError as exc:
+                self._disable_after_failure(exc)
+        self.event_sink.audit(record)
 
     def _disable_after_failure(self, exc: OSError) -> None:
         self.enabled = False
         if not self._failure_warned:
-            print(
-                f"warning: audit logging disabled after write failure: {exc}",
-                file=sys.stderr,
-            )
+            self.status(f"warning: audit logging disabled after write failure: {exc}")
             self._failure_warned = True
         self.close()
 

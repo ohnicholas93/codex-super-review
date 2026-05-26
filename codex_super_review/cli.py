@@ -8,7 +8,8 @@ from pathlib import Path
 
 from .cli_parsers import parse_bool, parse_model_spec, parse_percent, parse_positive_int
 from .constants import DEFAULT_IMPLEMENTER_MODEL, DEFAULT_ORACLE_MODEL, DEFAULT_REVIEWER_MODEL
-from .diagnostics import _print_failure_details
+from .diagnostics import failure_details_lines
+from .event_sink import NullEventSink
 from .errors import (
     CodexAppServerFailure,
     CodexExecutableNotFound,
@@ -144,6 +145,11 @@ model_reasoning_effort="xhigh".""",
         default=os.environ.get("CODEX_SUPER_REVIEW_CODEX_BIN", "codex"),
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="Use legacy line-oriented terminal output instead of the interactive TUI.",
+    )
     return parser
 
 
@@ -161,31 +167,107 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 127
 
+    if _should_use_tui(args):
+        try:
+            from .tui import CursesUnavailable, run_tui
+
+            return run_tui(args, _run_with_error_handling)
+        except ImportError as exc:
+            print(
+                f"warning: could not import TUI support; falling back to legacy output: {exc}",
+                file=sys.stderr,
+            )
+        except CursesUnavailable as exc:
+            print(
+                f"warning: could not initialize TUI; falling back to legacy output: {exc}",
+                file=sys.stderr,
+            )
+
+    args.event_sink = NullEventSink()
+    return _run_with_error_handling(args, args.event_sink)
+
+
+def _should_use_tui(args: argparse.Namespace) -> bool:
+    term = os.environ.get("TERM", "")
+    return (
+        not args.no_tui
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and term not in {"", "dumb"}
+    )
+
+
+def _run_with_error_handling(
+    args: argparse.Namespace,
+    emit: object,
+) -> int:
     try:
         return orchestrate(args)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _emit_top_level_error(emit, "error", f"error: {exc}")
         return 2
     except KeyboardInterrupt:
-        print("Interrupted", file=sys.stderr)
+        _emit_top_level_error(emit, "interrupted", "Interrupted")
         return 130
     except CodexExecutableNotFound as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _emit_top_level_error(emit, "error", f"error: {exc}")
         return 127
     except CodexRunFailure as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        _print_failure_details(exc.result)
+        _emit_top_level_error(
+            emit,
+            "codex_run_failure",
+            f"error: {exc}",
+            details=failure_details_lines(exc.result),
+        )
         return exc.result.returncode or 1
     except CodexResultDiagnostics as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        _print_failure_details(exc.result)
+        _emit_top_level_error(
+            emit,
+            "codex_result_diagnostics",
+            f"error: {exc}",
+            details=failure_details_lines(exc.result),
+        )
         return 1
     except CodexAppServerFailure as exc:
-        print(f"error: implementer pre-fix compaction failed: {exc}", file=sys.stderr)
+        _emit_top_level_error(
+            emit,
+            "app_server_failure",
+            f"error: implementer pre-fix compaction failed: {exc}",
+        )
         return 1
     except LimitReached as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _emit_top_level_error(emit, "limit_reached", f"error: {exc}")
         return 2
     except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _emit_top_level_error(emit, "runtime_error", f"error: {exc}")
         return 1
+
+
+def _emit_top_level_error(
+    emit: object,
+    event: str,
+    message: str,
+    *,
+    details: list[str] | None = None,
+) -> None:
+    status = (
+        emit.status
+        if hasattr(emit, "status")
+        else emit
+        if callable(emit)
+        else print
+    )
+    status(message)
+    if details:
+        for line in details:
+            status(line)
+    if hasattr(emit, "audit"):
+        record: dict[str, object] = {
+            "event": event,
+            "message": message,
+            "review_round": None,
+            "fix_round": None,
+        }
+        if details:
+            record["diagnostics"] = details
+        emit.audit(record)

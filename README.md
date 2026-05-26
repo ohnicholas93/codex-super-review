@@ -45,6 +45,19 @@ Run the command from the project root you want Codex to review:
 codex-super-review
 ```
 
+When run in an interactive terminal, the command opens a curses TUI. Each
+review, fix, reverification, oracle, retry, warning, and completion audit event
+appears as a row. Use `Up`/`Down` or `j`/`k` to move, `Enter` to inspect a row,
+and `Esc` or `Backspace` to return from the detail view. During a run, the first
+`Ctrl+C` requests a graceful stop before the next reviewer stream and the second
+`Ctrl+C` aborts active Codex work. After completion, press `Ctrl+C` to quit.
+
+For scripts, non-interactive terminals, or legacy stderr-style output:
+
+```bash
+codex-super-review --no-tui
+```
+
 To resume an existing implementer session instead:
 
 ```bash

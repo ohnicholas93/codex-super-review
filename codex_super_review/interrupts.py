@@ -15,6 +15,7 @@ from typing import Any, Iterator
 class GracefulInterruptController:
     def __init__(self) -> None:
         self.stop_requested = False
+        self.abort_requested = False
         self._previous_handlers: dict[int, signal.Handlers] = {}
         self._active_process: subprocess.Popen[str] | None = None
 
@@ -36,12 +37,30 @@ class GracefulInterruptController:
         previous_process = self._active_process
         self._active_process = process
         try:
+            self.raise_if_abort_requested()
             yield
         finally:
+            if self.abort_requested:
+                self.terminate_process(process)
             self._active_process = previous_process
 
     def should_stop_before_next_reviewer(self) -> bool:
         return self.stop_requested
+
+    def request_stop(self) -> bool:
+        if self.stop_requested:
+            return False
+        self.stop_requested = True
+        return True
+
+    def request_abort(self) -> None:
+        self.stop_requested = True
+        self.abort_requested = True
+        self._signal_active_process(signal.SIGTERM)
+
+    def raise_if_abort_requested(self) -> None:
+        if self.abort_requested:
+            raise KeyboardInterrupt
 
     def subprocess_kwargs(self) -> dict[str, Any]:
         if os.name == "nt":
@@ -72,15 +91,14 @@ class GracefulInterruptController:
             self.terminate_active_process()
             raise SystemExit(128 + signum)
 
-        if not self.stop_requested:
-            self.stop_requested = True
+        if self.request_stop():
             print(
                 "\nInterrupt requested; stopping before the next reviewer stream. Press Ctrl+C again to abort immediately.",
                 file=sys.stderr,
             )
             return
 
-        self._signal_active_process(signal.SIGTERM)
+        self.request_abort()
         raise KeyboardInterrupt
 
     def _signal_active_process(self, signum: int) -> None:

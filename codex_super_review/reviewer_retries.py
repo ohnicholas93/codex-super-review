@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from collections.abc import Callable
 
 from .audit import AuditLogger
@@ -24,6 +23,11 @@ def _run_reviewer_review_with_retries(
     attempt = 0
     while True:
         reviewer = CodexReviewer(runner, reviewer_model)
+        audit.start(
+            "review",
+            review_round=review_round,
+            message=f"Reviewer stream {review_round}: initial review",
+        )
         result = reviewer.review(prompt)
         audit.log(
             "review",
@@ -54,9 +58,8 @@ def _run_reviewer_review_with_retries(
             if attempt >= MAX_REVIEWER_TOOL_RETRIES:
                 raise exc
             attempt += 1
-            print(
+            audit.status(
                 f"Reviewer stream {review_round} hit a transient failure during initial review; retrying with a fresh reviewer ({attempt}/{MAX_REVIEWER_TOOL_RETRIES})",
-                file=sys.stderr,
             )
             audit.log(
                 "reviewer_retryable_failure",
@@ -98,9 +101,27 @@ def _run_reviewer_reverify_with_retries(
                 else None,
                 merge_base=branch_scope.merge_base if branch_scope else None,
             )
+            audit.start(
+                "reviewer_reverify",
+                review_round=review_round,
+                fix_round=fix_round,
+                message=(
+                    f"Reviewer stream {review_round}, fix round {fix_round}: "
+                    "fresh reverification retry"
+                ),
+            )
             result = current_reviewer.review(retry_prompt)
         else:
             retry_prompt = prompt
+            audit.start(
+                "reviewer_reverify",
+                review_round=review_round,
+                fix_round=fix_round,
+                message=(
+                    f"Reviewer stream {review_round}, fix round {fix_round}: "
+                    "reverification"
+                ),
+            )
             result = current_reviewer.reverify(prompt)
         reverify_errors, reverify_diagnostics = _collect_problem_lines(result)
         if reverify_errors or reverify_diagnostics:
@@ -143,9 +164,8 @@ def _run_reviewer_reverify_with_retries(
             if attempt >= MAX_REVIEWER_TOOL_RETRIES:
                 raise exc
             attempt += 1
-            print(
+            audit.status(
                 f"Reviewer stream {review_round} hit a transient failure during reverification; retrying with a fresh reviewer ({attempt}/{MAX_REVIEWER_TOOL_RETRIES})",
-                file=sys.stderr,
             )
             audit.log(
                 "reviewer_retryable_failure",
@@ -180,9 +200,24 @@ def _run_reviewer_rewrite_without_rejected_with_retries(
         )
         if attempt > 0:
             current_reviewer = CodexReviewer(runner, reviewer_model)
+            audit.start(
+                "reviewer_rewrite_without_rejected",
+                review_round=review_round,
+                message=(
+                    f"Reviewer stream {review_round}: fresh rewrite retry "
+                    "without rejected findings"
+                ),
+            )
             result = current_reviewer.review(rewrite_prompt)
         else:
             current_reviewer = reviewer
+            audit.start(
+                "reviewer_rewrite_without_rejected",
+                review_round=review_round,
+                message=(
+                    f"Reviewer stream {review_round}: rewrite without rejected findings"
+                ),
+            )
             result = current_reviewer.reverify(rewrite_prompt)
         rewrite_errors, rewrite_diagnostics = _collect_problem_lines(result)
         if rewrite_errors or rewrite_diagnostics:
@@ -246,9 +281,8 @@ def _run_reviewer_rewrite_without_rejected_with_retries(
             if attempt >= MAX_REVIEWER_TOOL_RETRIES:
                 raise exc
             attempt += 1
-            print(
+            audit.status(
                 f"Reviewer stream {review_round} hit a transient failure while rewriting rejected findings; retrying with a fresh reviewer ({attempt}/{MAX_REVIEWER_TOOL_RETRIES})",
-                file=sys.stderr,
             )
             audit.log(
                 "reviewer_retryable_failure",

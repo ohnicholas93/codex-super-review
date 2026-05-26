@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -10,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .constants import IMPLEMENTER_APPROVALS_REVIEWER, IMPLEMENTER_APPROVAL_POLICY
+from .event_sink import NullEventSink
 from .errors import CodexExecutableNotFound
 from .interrupts import GracefulInterruptController
 from .models import CodexResult, ModelSpec
@@ -21,10 +21,12 @@ class CodexExecRunner:
         codex_bin: str,
         cwd: Path,
         interrupt_controller: GracefulInterruptController | None = None,
+        event_sink: Any | None = None,
     ) -> None:
         self.codex_bin = codex_bin
         self.cwd = cwd
         self.interrupt_controller = interrupt_controller
+        self.event_sink = event_sink if event_sink is not None else NullEventSink()
 
     def run(
         self,
@@ -38,6 +40,9 @@ class CodexExecRunner:
         approval_policy: str | None = None,
         approvals_reviewer: str | None = None,
     ) -> CodexResult:
+        if self.interrupt_controller is not None:
+            self.interrupt_controller.raise_if_abort_requested()
+
         with tempfile.NamedTemporaryFile(
             prefix="codex-super-review-", suffix=".txt", delete=False
         ) as tmp:
@@ -142,12 +147,12 @@ class CodexExecRunner:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         diagnostics.append(line)
-                        print(f"[{phase}] {line}", file=sys.stderr)
+                        self.event_sink.status(f"[{phase}] {line}")
                         continue
                     if not isinstance(event, dict):
                         diagnostic = f"unexpected non-object JSON event: {line}"
                         diagnostics.append(diagnostic)
-                        print(f"[{phase}] {diagnostic}", file=sys.stderr)
+                        self.event_sink.status(f"[{phase}] {diagnostic}")
                         continue
 
                     event_type = event.get("type")
@@ -201,6 +206,9 @@ class CodexExecRunner:
             )
         finally:
             self._remove_temp_file(last_message_path)
+
+        if self.interrupt_controller is not None:
+            self.interrupt_controller.raise_if_abort_requested()
 
         assert returncode is not None
         return CodexResult(

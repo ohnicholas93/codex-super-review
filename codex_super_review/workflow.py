@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import argparse
 import subprocess
 from pathlib import Path
@@ -13,7 +12,8 @@ from .constants import (
     IMPLEMENTER_APPROVALS_REVIEWER,
     IMPLEMENTER_APPROVAL_POLICY,
 )
-from .diagnostics import _collect_problem_lines, _print_round_diagnostics, ensure_success
+from .diagnostics import _collect_problem_lines, ensure_success, round_diagnostics_lines
+from .event_sink import NullEventSink
 from .errors import (
     CodexAppServerFailure,
     CodexExecutableNotFound,
@@ -45,8 +45,10 @@ from .workflow_helpers import _has_round_remaining, no_findings
 
 def orchestrate(args: argparse.Namespace) -> int:
     interrupt_controller = GracefulInterruptController()
+    event_sink = getattr(args, "event_sink", NullEventSink())
+    event_sink.set_interrupt_controller(interrupt_controller)
     cwd = Path.cwd()
-    runner = CodexExecRunner(args.codex_bin, cwd, interrupt_controller)
+    runner = CodexExecRunner(args.codex_bin, cwd, interrupt_controller, event_sink)
     implementer_model = parse_model_spec(args.implementer_model)
     reviewer_model = parse_model_spec(args.reviewer_model)
     oracle_model = parse_model_spec(args.oracle_model)
@@ -62,6 +64,7 @@ def orchestrate(args: argparse.Namespace) -> int:
         args.implementer_codex_session_id,
         implementer_model,
         reviewer_model,
+        event_sink,
     )
     round_diagnostics: list[RoundDiagnostics] = []
     implementer_responses: list[str] = []
@@ -89,41 +92,41 @@ def orchestrate(args: argparse.Namespace) -> int:
             raise
 
         if audit.path is not None:
-            print(f"Audit log: {audit.path}", file=sys.stderr)
+            event_sink.header("Audit log", str(audit.path))
+            event_sink.status(f"Audit log: {audit.path}")
         if implementer.thread_id is None:
-            print(
-                "Implementer session: a fresh session will be created on the first fix round",
-                file=sys.stderr,
+            event_sink.header(
+                "Implementer",
+                "fresh session on first fix round",
+            )
+            event_sink.status(
+                "Implementer session: a fresh session will be created on the first fix round"
             )
         else:
-            print(f"Implementer session: {implementer.thread_id}", file=sys.stderr)
-        print(
-            f"Requested implementer model: {implementer_model.display}", file=sys.stderr
+            event_sink.header("Implementer", implementer.thread_id)
+            event_sink.status(f"Implementer session: {implementer.thread_id}")
+        event_sink.header(
+            "Models",
+            (
+                f"implementer {implementer_model.display}; "
+                f"reviewer {reviewer_model.display}; oracle {oracle_model.display}"
+            ),
         )
-        print(
-            f"Implementer approval policy: {IMPLEMENTER_APPROVAL_POLICY}",
-            file=sys.stderr,
-        )
-        print(
-            f"Implementer approvals reviewer: {IMPLEMENTER_APPROVALS_REVIEWER}",
-            file=sys.stderr,
-        )
-        print(f"Requested reviewer model: {reviewer_model.display}", file=sys.stderr)
-        print(f"Requested oracle model: {oracle_model.display}", file=sys.stderr)
-        print(
-            f"Review scope: {'branch' if branch_scope is not None else 'changes'}",
-            file=sys.stderr,
-        )
+        event_sink.status(f"Requested implementer model: {implementer_model.display}")
+        event_sink.status(f"Implementer approval policy: {IMPLEMENTER_APPROVAL_POLICY}")
+        event_sink.status(f"Implementer approvals reviewer: {IMPLEMENTER_APPROVALS_REVIEWER}")
+        event_sink.status(f"Requested reviewer model: {reviewer_model.display}")
+        event_sink.status(f"Requested oracle model: {oracle_model.display}")
+        event_sink.header("Review scope", "branch" if branch_scope is not None else "changes")
+        event_sink.status(f"Review scope: {'branch' if branch_scope is not None else 'changes'}")
         if branch_scope is not None:
-            print(f"Branch base: {branch_scope.base_ref}", file=sys.stderr)
-            print(f"Branch base commit: {branch_scope.base_commit}", file=sys.stderr)
-            print(f"Branch HEAD commit: {branch_scope.head_commit}", file=sys.stderr)
-            print(
-                f"Branch HEAD ref: {branch_scope.head_ref or '(detached)'}",
-                file=sys.stderr,
-            )
-            print(f"Merge base: {branch_scope.merge_base}", file=sys.stderr)
-        print(f"Oracle workspace: {oracle_cwd}", file=sys.stderr)
+            event_sink.status(f"Branch base: {branch_scope.base_ref}")
+            event_sink.status(f"Branch base commit: {branch_scope.base_commit}")
+            event_sink.status(f"Branch HEAD commit: {branch_scope.head_commit}")
+            event_sink.status(f"Branch HEAD ref: {branch_scope.head_ref or '(detached)'}")
+            event_sink.status(f"Merge base: {branch_scope.merge_base}")
+        event_sink.header("Oracle workspace", str(oracle_cwd))
+        event_sink.status(f"Oracle workspace: {oracle_cwd}")
 
         outer_round = 0
         while _has_round_remaining(outer_round, args.max_new_reviewer_streams):
@@ -133,10 +136,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                     review_round=outer_round,
                     message="interrupt requested; stopped before starting the next reviewer stream",
                 )
-                print(
-                    "Stopped before starting the next reviewer stream",
-                    file=sys.stderr,
-                )
+                event_sink.status("Stopped before starting the next reviewer stream")
                 return 130
             outer_round += 1
             if interrupt_controller.should_stop_before_next_reviewer():
@@ -145,12 +145,9 @@ def orchestrate(args: argparse.Namespace) -> int:
                     review_round=outer_round,
                     message="interrupt requested; stopped before starting the next reviewer stream",
                 )
-                print(
-                    "Stopped before starting the next reviewer stream",
-                    file=sys.stderr,
-                )
+                event_sink.status("Stopped before starting the next reviewer stream")
                 return 130
-            print(f"Starting reviewer stream {outer_round}", file=sys.stderr)
+            event_sink.status(f"Starting reviewer stream {outer_round}")
 
             reviewer, review_result = _run_reviewer_review_with_retries(
                 runner,
@@ -175,7 +172,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                     reviewer_thread_id=reviewer.thread_id,
                     message="fresh reviewer found no findings",
                 )
-                print("Complete: fresh reviewer returned NO_FINDINGS", file=sys.stderr)
+                event_sink.status("Complete: fresh reviewer returned NO_FINDINGS")
                 return 0
 
             fix_round = 0
@@ -210,9 +207,8 @@ def orchestrate(args: argparse.Namespace) -> int:
                                 "oracle_workspace": str(oracle_cwd),
                             },
                         )
-                        print(
-                            f"Warning: oracle unavailable; continuing without rejected-finding dedupe ({exc})",
-                            file=sys.stderr,
+                        event_sink.status(
+                            f"Warning: oracle unavailable; continuing without rejected-finding dedupe ({exc})"
                         )
                         candidate_oracle_client = None
                     if candidate_oracle_client is not None:
@@ -225,9 +221,13 @@ def orchestrate(args: argparse.Namespace) -> int:
                         )
                 classification = None
                 if oracle is not None:
-                    print(
-                        f"Reviewer stream {outer_round}: checking for previously rejected findings",
-                        file=sys.stderr,
+                    audit.start(
+                        "oracle_classification",
+                        review_round=outer_round,
+                        message=(
+                            f"Reviewer stream {outer_round}: checking for previously "
+                            "rejected findings"
+                        ),
                     )
                     classification = oracle.classify(
                         latest_developer_response=implementer_responses[-1],
@@ -235,9 +235,8 @@ def orchestrate(args: argparse.Namespace) -> int:
                         review_round=outer_round,
                     )
                     if classification is None:
-                        print(
-                            "Warning: oracle classification unavailable; continuing without rejected-finding dedupe",
-                            file=sys.stderr,
+                        event_sink.status(
+                            "Warning: oracle classification unavailable; continuing without rejected-finding dedupe"
                         )
                         if oracle.reset_client_after_failure:
                             audit.log(
@@ -269,9 +268,8 @@ def orchestrate(args: argparse.Namespace) -> int:
                                 "explanation": classification.explanation,
                             },
                         )
-                        print(
-                            "Complete: fresh reviewer only returned previously rejected findings",
-                            file=sys.stderr,
+                        event_sink.status(
+                            "Complete: fresh reviewer only returned previously rejected findings"
                         )
                         return 0
                     if classification.status == "HAS_REJECTED_AND_NEW_FINDINGS":
@@ -313,41 +311,29 @@ def orchestrate(args: argparse.Namespace) -> int:
                                     "phase": exc.phase,
                                 },
                             )
-                            print(
-                                "Warning: reviewer rewrite without rejected findings failed; continuing with original reviewer comments",
-                                file=sys.stderr,
+                            event_sink.status(
+                                "Warning: reviewer rewrite without rejected findings failed; continuing with original reviewer comments"
                             )
                         else:
                             current_comments = rewrite_result.response
                             if no_findings(current_comments):
-                                audit.log(
-                                    "complete_rewrite_without_rejected_findings",
-                                    review_round=outer_round,
-                                    reviewer_thread_id=reviewer.thread_id,
-                                    response=current_comments,
-                                    result=rewrite_result,
-                                    message="sanitized reviewer comments returned NO_FINDINGS",
-                                    extra={
-                                        "explanation": classification.explanation,
-                                    },
-                                )
-                                print(
-                                    "Complete: removing previously rejected findings left no remaining findings",
-                                    file=sys.stderr,
+                                event_sink.status(
+                                    "Complete: removing previously rejected findings left no remaining findings"
                                 )
                                 return 0
 
             while _has_round_remaining(fix_round, args.max_fix_rounds_per_reviewer):
                 fix_round += 1
-                print(
-                    f"Reviewer {outer_round}, fix round {fix_round}: sending findings to implementer",
-                    file=sys.stderr,
+                event_sink.status(
+                    f"Reviewer {outer_round}, fix round {fix_round}: sending findings to implementer"
                 )
 
                 if fix_round == 1:
-                    print(
-                        "Checking implementer context before first fix round",
-                        file=sys.stderr,
+                    audit.start(
+                        "implementer_precompact",
+                        review_round=outer_round,
+                        fix_round=fix_round,
+                        message="Checking implementer context before first fix round",
                     )
                     precompact_result = maybe_compact_implementer_before_first_fix(
                         codex_bin=args.codex_bin,
@@ -357,7 +343,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                         threshold_percent=args.implementer_compact_threshold_percent,
                         interrupt_controller=interrupt_controller,
                     )
-                    print(precompact_result.message, file=sys.stderr)
+                    event_sink.status(precompact_result.message)
                     audit.log(
                         "implementer_precompact",
                         review_round=outer_round,
@@ -376,6 +362,15 @@ def orchestrate(args: argparse.Namespace) -> int:
                     )
 
                 implementer_prompt = f"{current_prompt}\n\n{current_comments}"
+                audit.start(
+                    "implementer_fix",
+                    review_round=outer_round,
+                    fix_round=fix_round,
+                    message=(
+                        f"Reviewer {outer_round}, fix round {fix_round}: "
+                        "implementer fix"
+                    ),
+                )
                 fix_result = implementer.fix(implementer_prompt)
                 if (
                     implementer.thread_id is not None
@@ -383,10 +378,8 @@ def orchestrate(args: argparse.Namespace) -> int:
                 ):
                     last_logged_implementer_thread_id = implementer.thread_id
                     audit.set_implementer_thread_id(implementer.thread_id)
-                    print(
-                        f"Implementer session: {implementer.thread_id}",
-                        file=sys.stderr,
-                    )
+                    event_sink.header("Implementer", implementer.thread_id)
+                    event_sink.status(f"Implementer session: {implementer.thread_id}")
                 fix_errors, fix_diagnostics = _collect_problem_lines(fix_result)
                 if fix_errors or fix_diagnostics:
                     round_diagnostics.append(
@@ -469,14 +462,15 @@ def orchestrate(args: argparse.Namespace) -> int:
                         reviewer_thread_id=reviewer.thread_id,
                         message="reviewer stream satisfied",
                     )
-                    print(f"Reviewer stream {outer_round} satisfied", file=sys.stderr)
-                    _print_round_diagnostics(
+                    event_sink.status(f"Reviewer stream {outer_round} satisfied")
+                    for line in round_diagnostics_lines(
                         [
                             entry
                             for entry in round_diagnostics
                             if entry.review_round == outer_round
                         ]
-                    )
+                    ):
+                        event_sink.status(line)
                     break
 
                 current_prompt = followup_fix_prompt

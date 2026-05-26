@@ -41,6 +41,9 @@ class AppServerJsonRpcClient:
         self._stderr_reader: threading.Thread | None = None
 
     def __enter__(self) -> "AppServerJsonRpcClient":
+        if self.interrupt_controller is not None:
+            self.interrupt_controller.raise_if_abort_requested()
+
         command = [
             self.codex_bin,
             "app-server",
@@ -137,9 +140,11 @@ class AppServerJsonRpcClient:
         )
         deadline = time.monotonic() + APP_SERVER_TOKEN_USAGE_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            message = self.next_message(timeout=max(0.1, deadline - time.monotonic()))
+            if self.interrupt_controller is not None:
+                self.interrupt_controller.raise_if_abort_requested()
+            message = self.next_message(timeout=_poll_timeout(deadline))
             if message is None:
-                break
+                continue
             if (
                 message.get("method") == "thread/tokenUsage/updated"
                 and _get_nested(message, "params", "threadId") == thread_id
@@ -200,9 +205,11 @@ class AppServerJsonRpcClient:
         turn_status: str | None = None
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            message = self.next_message(timeout=max(0.1, deadline - time.monotonic()))
+            if self.interrupt_controller is not None:
+                self.interrupt_controller.raise_if_abort_requested()
+            message = self.next_message(timeout=_poll_timeout(deadline))
             if message is None:
-                break
+                continue
             if _get_nested(message, "params", "threadId") != thread_id:
                 continue
             message_turn_id = _turn_id_from_message(message)
@@ -256,9 +263,11 @@ class AppServerJsonRpcClient:
         saw_compaction_item = False
         deadline = time.monotonic() + APP_SERVER_COMPACTION_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            message = self.next_message(timeout=max(0.1, deadline - time.monotonic()))
+            if self.interrupt_controller is not None:
+                self.interrupt_controller.raise_if_abort_requested()
+            message = self.next_message(timeout=_poll_timeout(deadline))
             if message is None:
-                break
+                continue
             if _get_nested(message, "params", "threadId") != thread_id:
                 continue
             method = message.get("method")
@@ -297,29 +306,31 @@ class AppServerJsonRpcClient:
         payload: dict[str, Any] = {"id": request_id, "method": method}
         if params is not None:
             payload["params"] = params
+        if self.interrupt_controller is not None:
+            self.interrupt_controller.raise_if_abort_requested()
         self._send(payload)
         deadline = time.monotonic() + timeout
         ignored_messages: list[dict[str, Any]] = []
-        while time.monotonic() < deadline:
-            message = self._read_queue_message(
-                timeout=max(0.1, deadline - time.monotonic())
-            )
-            if message is None:
-                break
-            if message.get("id") != request_id:
-                ignored_messages.append(message)
-                continue
-            if "error" in message:
-                self._pending_messages.extendleft(reversed(ignored_messages))
-                error = message["error"]
-                if isinstance(error, dict):
-                    raise CodexAppServerFailure(
-                        f"{method} failed: {error.get('message', error)}"
-                    )
-                raise CodexAppServerFailure(f"{method} failed: {error}")
+        try:
+            while time.monotonic() < deadline:
+                if self.interrupt_controller is not None:
+                    self.interrupt_controller.raise_if_abort_requested()
+                message = self._read_queue_message(timeout=_poll_timeout(deadline))
+                if message is None:
+                    continue
+                if message.get("id") != request_id:
+                    ignored_messages.append(message)
+                    continue
+                if "error" in message:
+                    error = message["error"]
+                    if isinstance(error, dict):
+                        raise CodexAppServerFailure(
+                            f"{method} failed: {error.get('message', error)}"
+                        )
+                    raise CodexAppServerFailure(f"{method} failed: {error}")
+                return message.get("result")
+        finally:
             self._pending_messages.extendleft(reversed(ignored_messages))
-            return message.get("result")
-        self._pending_messages.extendleft(reversed(ignored_messages))
         raise CodexAppServerFailure(
             f"timed out waiting for app-server response to {method}"
         )
@@ -440,6 +451,10 @@ def _turn_id_from_message(message: dict[str, Any]) -> str | None:
     if isinstance(turn_id, str):
         return turn_id
     return None
+
+
+def _poll_timeout(deadline: float) -> float:
+    return max(0.0, min(0.1, deadline - time.monotonic()))
 
 
 def _merge_app_server_items(
