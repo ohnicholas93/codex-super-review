@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import curses
 import json
+import os
 import signal
 import textwrap
 import threading
@@ -141,8 +142,16 @@ def _curses_main(
                         break
                     sink.request_interrupt()
                 elif view == "detail":
+                    height, width = stdscr.getmaxyx()
+                    content_start_y = _content_start_y(snapshot, view, height)
                     detail_scroll = _handle_detail_key(
-                        key, detail_scroll, snapshot, detail_row_id
+                        key,
+                        detail_scroll,
+                        snapshot,
+                        detail_row_id,
+                        width,
+                        height,
+                        content_start_y,
                     )
                     if key in (27, curses.KEY_BACKSPACE, 8, 127):
                         view = "list"
@@ -231,6 +240,9 @@ def _handle_detail_key(
     detail_scroll: int,
     snapshot: TuiSnapshot,
     detail_row_id: int | None,
+    width: int,
+    height: int,
+    start_y: int,
 ) -> int:
     if key in (curses.KEY_UP, ord("k")):
         detail_scroll -= 1
@@ -243,8 +255,15 @@ def _handle_detail_key(
     elif key == curses.KEY_NPAGE:
         detail_scroll += 10
     elif key == curses.KEY_END:
-        detail_scroll = len(_detail_lines(snapshot, detail_row_id, 80))
-    return max(0, detail_scroll)
+        detail_scroll = len(_detail_lines(snapshot, detail_row_id, width))
+    return _clamp_detail_scroll(
+        detail_scroll,
+        snapshot,
+        detail_row_id,
+        width,
+        height,
+        start_y,
+    )
 
 
 def _draw(
@@ -259,7 +278,8 @@ def _draw(
 ) -> None:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
-    if height < 8 or width < 40:
+    min_height = 11 if view == "detail" else 9
+    if height < min_height or width < 40:
         _add(stdscr, 0, 0, "codex-super-review: terminal is too small")
         stdscr.refresh()
         return
@@ -267,26 +287,66 @@ def _draw(
     spinner = " " if snapshot.finished else SPINNER[tick % len(SPINNER)]
     code = "" if snapshot.returncode is None else f" exit={snapshot.returncode}"
     title = f" codex-super-review {spinner}{code} "
-    _add(stdscr, 0, 0, title.ljust(width), _color(1) | curses.A_BOLD)
-    _add(stdscr, 1, 0, _clip(snapshot.status_message, width), _color(5))
+    timer = _timer_text(snapshot, view, detail_row_id)
+    title_line = _right_aligned_line(title, timer, width)
+    _add(stdscr, 0, 0, title_line, _color(1))
 
-    header = _header_line(snapshot.headers)
-    _add(stdscr, 2, 0, _clip(header, width))
+    y = 2
+    _add(stdscr, y, 0, _clip(snapshot.status_message, width), _color(5))
+    y += 2
+
+    for line in _header_lines(snapshot.headers, height, view):
+        _add(stdscr, y, 0, _clip(line, width))
+        y += 1
+
     if snapshot.finished:
         _add(
             stdscr,
-            3,
+            y,
             0,
             _clip((snapshot.final_message or "Done") + " - press Ctrl+C to quit", width),
             _color(2 if snapshot.returncode == 0 else 4) | curses.A_BOLD,
         )
     else:
-        _add(stdscr, 3, 0, "Ctrl+C: graceful stop; Ctrl+C again: abort")
+        _add(
+            stdscr,
+            y,
+            0,
+            "Ctrl+C: graceful stop; Ctrl+C again: abort",
+            _color(5) | curses.A_BOLD,
+        )
+    y += 1
+    if view == "detail":
+        _add(
+            stdscr,
+            y,
+            0,
+            "Detail - Esc/Backspace: back",
+            _color(5) | curses.A_BOLD,
+        )
+
+    content_start_y = _content_start_y(snapshot, view, height)
 
     if view == "detail":
-        _draw_detail(stdscr, snapshot, detail_row_id, detail_scroll, width, height)
+        _draw_detail(
+            stdscr,
+            snapshot,
+            detail_row_id,
+            detail_scroll,
+            width,
+            height,
+            content_start_y,
+        )
     else:
-        _draw_list(stdscr, snapshot, selected, row_scroll, width, height)
+        _draw_list(
+            stdscr,
+            snapshot,
+            selected,
+            row_scroll,
+            width,
+            height,
+            content_start_y,
+        )
     stdscr.refresh()
 
 
@@ -297,9 +357,15 @@ def _draw_list(
     row_scroll: int,
     width: int,
     height: int,
+    header_y: int,
 ) -> None:
-    header_y = 5
-    _add(stdscr, header_y, 0, _clip("Status   Event                          Rev Fix  Elapsed  Summary", width), curses.A_BOLD)
+    _add(
+        stdscr,
+        header_y,
+        0,
+        _clip("Status   Event                          Rev Fix  Elapsed  Summary", width),
+        curses.A_BOLD,
+    )
     rows = snapshot.rows
     visible = max(1, height - header_y - 2)
     if selected < row_scroll:
@@ -333,15 +399,14 @@ def _draw_detail(
     detail_scroll: int,
     width: int,
     height: int,
+    start_y: int,
 ) -> None:
     lines = _detail_lines(snapshot, detail_row_id, width)
-    start_y = 5
-    visible = max(1, height - start_y - 2)
+    visible = max(1, height - start_y - 1)
     max_scroll = max(0, len(lines) - visible)
     detail_scroll = min(detail_scroll, max_scroll)
-    _add(stdscr, start_y, 0, _clip("Detail - Esc/Backspace: back", width), curses.A_BOLD)
     for index, line in enumerate(lines[detail_scroll : detail_scroll + visible]):
-        _add(stdscr, start_y + 1 + index, 0, _clip(line, width))
+        _add(stdscr, start_y + index, 0, _clip(line, width))
     footer = f"line {min(detail_scroll + 1, len(lines) or 1)}/{max(len(lines), 1)}"
     _add(stdscr, height - 1, 0, _clip(footer, width), curses.A_DIM)
 
@@ -356,34 +421,44 @@ def _detail_lines(
         return ["No row selected"]
     record = row.record or {}
     lines = [
+        "",
+        "Summary",
+        "-" * min(24, max(8, width - 1)),
         f"event: {row.event}",
         f"status: {row.status}",
         f"review_round: {_num(row.review_round)}",
         f"fix_round: {_num(row.fix_round)}",
-        f"elapsed: {_elapsed(row)}",
         f"summary: {row.message}",
     ]
+    metadata: list[str] = []
     for key in (
         "timestamp",
         "implementer_thread_id",
         "reviewer_thread_id",
         "codex_exit_code",
         "usage",
-        "event_types",
         "codex_errors",
         "diagnostics",
         "extra",
         "message",
     ):
         if key in record and record[key] not in (None, [], {}):
-            lines.extend(_wrapped_field(key, record[key], width))
+            metadata.extend(_wrapped_field(key, record[key], width))
+    if metadata:
+        lines.append("")
+        lines.extend(_section_lines("Metadata", width))
+        lines.extend(metadata)
     for key in ("response", "prompt"):
         value = record.get(key)
         if isinstance(value, str) and value:
             lines.append("")
-            lines.append(f"{key}:")
+            lines.extend(_section_lines(key.title(), width))
             lines.extend(_wrap_text(value, width))
     return lines
+
+
+def _section_lines(title: str, width: int) -> list[str]:
+    return [title, "-" * min(24, max(8, width - 1))]
 
 
 def _wrapped_field(key: str, value: Any, width: int) -> list[str]:
@@ -402,13 +477,113 @@ def _wrap_text(text: str, width: int) -> list[str]:
     return lines
 
 
-def _header_line(headers: dict[str, str]) -> str:
+def _content_start_y(snapshot: TuiSnapshot, view: str, height: int) -> int:
+    y = 4
+    y += len(_header_lines(snapshot.headers, height, view))
+    y += 1
+    if view == "detail":
+        y += 1
+        return y
+    return y + 1
+
+
+def _clamp_detail_scroll(
+    detail_scroll: int,
+    snapshot: TuiSnapshot,
+    detail_row_id: int | None,
+    width: int,
+    height: int,
+    start_y: int,
+) -> int:
+    lines = _detail_lines(snapshot, detail_row_id, width)
+    visible = max(1, height - start_y - 1)
+    max_scroll = max(0, len(lines) - visible)
+    return max(0, min(detail_scroll, max_scroll))
+
+
+def _header_lines(
+    headers: dict[str, str],
+    height: int | None = None,
+    view: str = "list",
+) -> list[str]:
     if not headers:
-        return ""
-    preferred = ["Audit log", "Implementer", "Models", "Review scope", "Oracle workspace"]
-    parts = [f"{key}: {headers[key]}" for key in preferred if key in headers]
-    parts.extend(f"{key}: {value}" for key, value in headers.items() if key not in preferred)
-    return " | ".join(parts)
+        return []
+    preferred = [
+        "Audit log",
+        "Implementer",
+        "Models I/R/O",
+        "Review scope",
+        "Oracle workspace",
+    ]
+    lines = [
+        f"{key}: {_header_value(key, headers[key])}"
+        for key in preferred
+        if key in headers
+    ]
+    lines.extend(
+        f"{key}: {_header_value(key, value)}"
+        for key, value in headers.items()
+        if key not in preferred
+    )
+    if height is None:
+        return lines
+    max_lines = _max_header_lines(height, view)
+    if len(lines) <= max_lines:
+        return lines
+    if max_lines <= 0:
+        return []
+    if max_lines == 1:
+        return [f"... {len(lines)} header lines"]
+    hidden = len(lines) - max_lines + 1
+    return [*lines[: max_lines - 1], f"... {hidden} more header lines"]
+
+
+def _max_header_lines(height: int, view: str) -> int:
+    if view == "detail":
+        return max(0, height - 11)
+    return max(0, height - 9)
+
+
+def _header_value(key: str, value: str) -> str:
+    if key == "Audit log":
+        marker = "/codex-super-review/audit/"
+        if marker in value:
+            return value.rsplit(marker, 1)[1]
+    if key == "Oracle workspace":
+        return _home_relative(value)
+    return value
+
+
+def _home_relative(value: str) -> str:
+    home = os.path.expanduser("~")
+    if value == home:
+        return "~"
+    if value.startswith(home + os.sep):
+        return "~" + value[len(home):]
+    return value
+
+
+def _timer_text(
+    snapshot: TuiSnapshot,
+    view: str,
+    detail_row_id: int | None,
+) -> str:
+    total_end = snapshot.finished_at if snapshot.finished_at is not None else time.monotonic()
+    total = _format_elapsed(total_end - snapshot.started_at)
+    if view != "detail":
+        return total
+    row = next((item for item in snapshot.rows if item.id == detail_row_id), None)
+    if row is None:
+        return total
+    return f"{_elapsed(row)} / {total}"
+
+
+def _right_aligned_line(left: str, right: str, width: int) -> str:
+    if not right:
+        return left.ljust(width)
+    available = max(0, width - len(right) - 1)
+    left = left[:available]
+    return f"{left}{' ' * max(1, width - len(left) - len(right))}{right}"
 
 
 def _row_attr(row: TuiRow) -> int:
@@ -425,7 +600,11 @@ def _row_attr(row: TuiRow) -> int:
 
 def _elapsed(row: TuiRow) -> str:
     end = row.completed_at if row.completed_at is not None else time.monotonic()
-    seconds = max(0, int(end - row.started_at))
+    return _format_elapsed(end - row.started_at)
+
+
+def _format_elapsed(elapsed: float) -> str:
+    seconds = max(0, int(elapsed))
     minutes, seconds = divmod(seconds, 60)
     return f"{minutes:02d}:{seconds:02d}"
 

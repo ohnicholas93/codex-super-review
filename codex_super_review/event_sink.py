@@ -25,6 +25,8 @@ class TuiSnapshot:
     rows: tuple[TuiRow, ...]
     headers: dict[str, str]
     status_message: str
+    started_at: float
+    finished_at: float | None
     finished: bool
     returncode: int | None
     final_message: str | None
@@ -67,6 +69,8 @@ class TuiEventSink:
         self._rows: list[TuiRow] = []
         self._headers: dict[str, str] = {}
         self._status_message = "Starting"
+        self._started_at = time.monotonic()
+        self._finished_at: float | None = None
         self._finished = False
         self._returncode: int | None = None
         self._final_message: str | None = None
@@ -189,6 +193,7 @@ class TuiEventSink:
     def finish(self, returncode: int, message: str | None = None) -> None:
         with self._lock:
             self._finished = True
+            self._finished_at = time.monotonic()
             self._returncode = returncode
             self._final_message = message or (
                 "Review complete" if returncode == 0 else f"Review exited with {returncode}"
@@ -240,6 +245,8 @@ class TuiEventSink:
                 rows=tuple(replace(row, record=row.record.copy() if row.record else None) for row in self._rows),
                 headers=self._headers.copy(),
                 status_message=self._status_message,
+                started_at=self._started_at,
+                finished_at=self._finished_at,
                 finished=self._finished,
                 returncode=self._returncode,
                 final_message=self._final_message,
