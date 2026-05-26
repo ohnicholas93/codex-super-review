@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .diagnostics import codex_errors_for_diagnostics
 from .event_sink import NullEventSink
 from .models import CodexResult, ModelSpec
 
@@ -171,7 +172,9 @@ class AuditLogger:
             "codex_exit_code": result.returncode if result is not None else None,
             "usage": result.usage if result is not None else None,
             "event_types": result.event_types if result is not None else None,
-            "codex_errors": result.errors if result is not None else None,
+            "codex_errors": (
+                codex_errors_for_diagnostics(result) if result is not None else None
+            ),
             "diagnostics": result.diagnostics[-20:] if result is not None else None,
             "message": message,
         }
