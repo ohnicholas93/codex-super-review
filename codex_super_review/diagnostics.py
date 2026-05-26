@@ -5,13 +5,23 @@ import sys
 from .errors import CodexResultDiagnostics, CodexRunFailure
 from .models import CodexResult, RoundDiagnostics
 
+def codex_errors_for_diagnostics(result: CodexResult) -> list[str]:
+    recovered_turn = result.returncode == 0 and "turn.completed" in result.event_types
+    return [
+        line
+        for line in result.errors
+        if not (recovered_turn and line.startswith("Reconnecting..."))
+    ]
+
+
 def _collect_problem_lines(result: CodexResult) -> tuple[list[str], list[str]]:
+    errors = codex_errors_for_diagnostics(result)
     diagnostic_lines = [
         line
         for line in result.diagnostics
         if "ERROR " in line or "error=" in line.lower()
     ]
-    return result.errors.copy(), diagnostic_lines
+    return errors, diagnostic_lines
 
 
 def _round_diagnostics_summary(entry: RoundDiagnostics) -> str:
@@ -67,9 +77,10 @@ def _print_failure_details(result: CodexResult) -> None:
 
 def failure_details_lines(result: CodexResult) -> list[str]:
     lines: list[str] = []
-    if result.errors:
+    errors = codex_errors_for_diagnostics(result)
+    if errors:
         lines.append("Codex errors:")
-        for error in result.errors:
+        for error in errors:
             lines.append(f"  {error}")
     if result.diagnostics:
         lines.append("Diagnostics:")

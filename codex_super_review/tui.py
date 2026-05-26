@@ -373,36 +373,51 @@ def _curses_main(
                 )
                 tick += 1
 
-                key = stdscr.getch()
-
-                if key == -1:
-                    pass
-                elif key == 3:
-                    if ctrl_c_quits or snapshot.finished:
-                        break
-                    sink.request_interrupt()
-                elif view == "detail":
-                    height, width = stdscr.getmaxyx()
-                    content_start_y = _content_start_y(snapshot, view, height)
-                    detail_scroll = _handle_detail_key(
-                        key,
-                        detail_scroll,
-                        snapshot,
-                        detail_row_id,
-                        width,
-                        height,
-                        content_start_y,
-                    )
-                    if key in (27, curses.KEY_BACKSPACE, 8, 127):
-                        view = "list"
-                        detail_row_id = None
-                else:
-                    selected, row_scroll, view, detail_row_id = _handle_list_key(
-                        key, selected, row_scroll, rows
-                    )
+                keys = _pending_keys(stdscr)
+                should_break = False
+                for key in keys:
+                    if key == 3:
+                        if ctrl_c_quits or snapshot.finished:
+                            should_break = True
+                            break
+                        sink.request_interrupt()
+                    elif view == "detail":
+                        height, width = stdscr.getmaxyx()
+                        content_start_y = _content_start_y(snapshot, view, height)
+                        previous_view = view
+                        detail_scroll = _handle_detail_key(
+                            key,
+                            detail_scroll,
+                            snapshot,
+                            detail_row_id,
+                            width,
+                            height,
+                            content_start_y,
+                        )
+                        if key in (27, curses.KEY_BACKSPACE, 8, 127):
+                            view = "list"
+                            detail_row_id = None
+                        if view != previous_view:
+                            break
+                    else:
+                        previous_view = view
+                        previous_detail_row_id = detail_row_id
+                        selected, row_scroll, view, detail_row_id = _handle_list_key(
+                            key, selected, row_scroll, rows
+                        )
+                        if (
+                            view != previous_view
+                            or detail_row_id != previous_detail_row_id
+                        ):
+                            detail_scroll = 0
+                            break
+                if should_break:
+                    break
 
                 if not thread.is_alive() and snapshot.finished:
                     time.sleep(0.08)
+                elif keys:
+                    time.sleep(0.01)
                 else:
                     time.sleep(0.1)
             except KeyboardInterrupt:
@@ -415,6 +430,18 @@ def _curses_main(
             sink.terminate_active_process()
         _restore_signal_handlers(previous_handlers)
         thread.join(timeout=3.0)
+
+
+def _pending_keys(stdscr: Any) -> list[int]:
+    keys: list[int] = []
+    for _ in range(128):
+        key = stdscr.getch()
+        if key == -1:
+            break
+        keys.append(key)
+        if key == 3:
+            break
+    return keys
 
 
 def _install_signal_handlers(
