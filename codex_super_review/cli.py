@@ -6,6 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from .audit import ensure_audit_log_available
 from .cli_parsers import parse_bool, parse_model_spec, parse_percent, parse_positive_int
 from .constants import DEFAULT_IMPLEMENTER_MODEL, DEFAULT_ORACLE_MODEL, DEFAULT_REVIEWER_MODEL
 from .diagnostics import failure_details_lines
@@ -202,9 +203,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if _should_use_tui(args):
         try:
+            ensure_audit_log_available()
             from .tui import CursesUnavailable, run_tui
 
             return run_tui(args, _run_with_error_handling)
+        except OSError as exc:
+            print(
+                f"warning: could not create audit log; falling back to legacy output: {exc}",
+                file=sys.stderr,
+            )
         except ImportError as exc:
             print(
                 f"warning: could not import TUI support; falling back to legacy output: {exc}",
@@ -215,6 +222,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"warning: could not initialize TUI; falling back to legacy output: {exc}",
                 file=sys.stderr,
             )
+    elif _would_use_tui_if_audit_enabled(args):
+        print(
+            "warning: TUI requires audit logging; falling back to legacy output",
+            file=sys.stderr,
+        )
 
     args.event_sink = NullEventSink()
     return _run_with_error_handling(args, args.event_sink)
@@ -259,6 +271,10 @@ def _option_present(raw_args: list[str], option: str) -> bool:
 
 
 def _should_use_tui(args: argparse.Namespace) -> bool:
+    return args.write_audit_log and _would_use_tui_if_audit_enabled(args)
+
+
+def _would_use_tui_if_audit_enabled(args: argparse.Namespace) -> bool:
     term = os.environ.get("TERM", "")
     return (
         not args.no_tui

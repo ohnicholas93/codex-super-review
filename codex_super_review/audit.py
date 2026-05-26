@@ -9,6 +9,21 @@ from typing import Any
 from .event_sink import NullEventSink
 from .models import CodexResult, ModelSpec
 
+
+def ensure_audit_log_available() -> None:
+    audit_dir = AuditLogger._select_audit_dir()
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    test_path = audit_dir / f".codex-super-review-write-test-{os.getpid()}"
+    try:
+        with test_path.open("a", encoding="utf-8"):
+            pass
+    finally:
+        try:
+            test_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 class AuditLogger:
     def __init__(
         self,
@@ -171,11 +186,6 @@ class AuditLogger:
 
     def _disable_after_failure(self, exc: OSError) -> None:
         self.enabled = False
-        disable_file_backed_rows = getattr(
-            self.event_sink, "disable_file_backed_rows", None
-        )
-        if callable(disable_file_backed_rows):
-            disable_file_backed_rows()
         if not self._failure_warned:
             self.status(f"warning: audit logging disabled after write failure: {exc}")
             self._failure_warned = True

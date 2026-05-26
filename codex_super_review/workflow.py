@@ -70,6 +70,9 @@ def orchestrate(args: argparse.Namespace) -> int:
         event_sink,
     )
     args._audit_logger = audit
+    if audit.path is not None:
+        event_sink.header("Audit log", str(audit.path))
+        event_sink.status(f"Audit log: {audit.path}")
     round_diagnostics: list[RoundDiagnostics] = []
     implementer_responses: list[str] = []
     branch_scope: BranchReviewScope | None = None
@@ -95,9 +98,6 @@ def orchestrate(args: argparse.Namespace) -> int:
             )
             raise
 
-        if audit.path is not None:
-            event_sink.header("Audit log", str(audit.path))
-            event_sink.status(f"Audit log: {audit.path}")
         if implementer.thread_id is None:
             event_sink.header(
                 "Implementer",

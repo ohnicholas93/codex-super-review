@@ -134,7 +134,6 @@ def _tail_active_audit_log(sink: TuiEventSink, stop_event: threading.Event) -> N
                 return
             time.sleep(0.05)
     except (OSError, ValueError) as exc:
-        sink.disable_file_backed_rows()
         sink.status(f"warning: audit log tail stopped: {exc}")
 
 
@@ -178,7 +177,6 @@ def _tail_audit_log(
                         finished_at=_record_monotonic_time(record),
                     )
     except (OSError, ValueError) as exc:
-        sink.disable_file_backed_rows()
         sink.status(f"warning: audit log tail stopped: {exc}")
 
 

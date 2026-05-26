@@ -51,6 +51,8 @@ appears as a row. Use `Up`/`Down` or `j`/`k` to move, `Enter` to inspect a row,
 and `Esc` or `Backspace` to return from the detail view. During a run, the first
 `Ctrl+C` requests a graceful stop before the next reviewer stream and the second
 `Ctrl+C` aborts active Codex work. After completion, press `Ctrl+C` to quit.
+The TUI is backed by the JSONL audit log; disabling audit logs uses legacy
+line-oriented output.
 
 For scripts, non-interactive terminals, or legacy stderr-style output:
 
@@ -162,6 +164,8 @@ Disable them explicitly if needed:
 ```bash
 codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log false
 ```
+
+Runs with audit logging disabled do not open the TUI.
 
 Logs are written to the first available location:
 

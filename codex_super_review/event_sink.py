@@ -79,7 +79,6 @@ class TuiEventSink:
         self._interrupt_controller: Any = None
         self._interrupt_count = 0
         self._abort_requested = False
-        self._file_backed_rows = False
 
     def set_interrupt_controller(self, controller: Any) -> None:
         with self._lock:
@@ -97,37 +96,14 @@ class TuiEventSink:
                 self._headers.pop(key, None)
             else:
                 self._headers[key] = value
-            if key == "Audit log" and value is not None:
-                self._file_backed_rows = True
 
     def header_value(self, key: str) -> str | None:
         with self._lock:
             return self._headers.get(key)
 
-    def disable_file_backed_rows(self) -> None:
-        with self._lock:
-            self._file_backed_rows = False
-
     def status(self, message: str) -> None:
         with self._lock:
             self._status_message = message
-            if (
-                _is_warning_message(message)
-                and not self._has_latest_row(message)
-            ):
-                self._rows.append(
-                    TuiRow(
-                        id=self._next_id,
-                        status="warning",
-                        event="warning",
-                        review_round=None,
-                        fix_round=None,
-                        message=message,
-                        started_at=time.monotonic(),
-                        completed_at=time.monotonic(),
-                    )
-                )
-                self._next_id += 1
 
     def start(
         self,
@@ -138,28 +114,10 @@ class TuiEventSink:
         message: str | None = None,
     ) -> None:
         with self._lock:
-            if self._file_backed_rows:
-                self._status_message = message or _event_title(event)
-                return
-            self._rows.append(
-                TuiRow(
-                    id=self._next_id,
-                    status="running",
-                    event=event,
-                    review_round=review_round,
-                    fix_round=fix_round,
-                    message=message or _event_title(event),
-                    started_at=time.monotonic(),
-                )
-            )
-            self._next_id += 1
             self._status_message = message or _event_title(event)
 
     def audit(self, record: dict[str, Any]) -> None:
-        with self._lock:
-            if self._file_backed_rows and record.get("cwd") is not None:
-                return
-        self.apply_audit_record(record)
+        return
 
     def apply_audit_record(self, record: dict[str, Any]) -> None:
         event = str(record.get("event") or "event")
@@ -196,14 +154,6 @@ class TuiEventSink:
                 and fix_round is None
             ):
                 row = self._find_latest_pending_row()
-            if row is None:
-                row = self._find_duplicate_completed_row(record)
-                if row is not None:
-                    row.status = status
-                    row.message = message
-                    row.record = record.copy()
-                    self._status_message = message
-                    return
             if row is None:
                 row = TuiRow(
                     id=self._next_id,
@@ -328,29 +278,6 @@ class TuiEventSink:
                 return row
         return None
 
-    def _find_duplicate_completed_row(self, record: dict[str, Any]) -> TuiRow | None:
-        timestamp = record.get("timestamp")
-        if not isinstance(timestamp, str):
-            return None
-        event = record.get("event")
-        review_round = _optional_int(record.get("review_round"))
-        fix_round = _optional_int(record.get("fix_round"))
-        for row in reversed(self._rows):
-            if row.status == "running" or row.record is None:
-                continue
-            row_record = row.record
-            if (
-                row_record.get("timestamp") == timestamp
-                and row_record.get("event") == event
-                and _optional_int(row_record.get("review_round")) == review_round
-                and _optional_int(row_record.get("fix_round")) == fix_round
-            ):
-                return row
-        return None
-
-    def _has_latest_row(self, message: str) -> bool:
-        return bool(self._rows and self._rows[-1].message == message)
-
 
 def _optional_int(value: Any) -> int | None:
     return value if isinstance(value, int) else None
@@ -400,10 +327,6 @@ def _is_warning_event(event: str) -> bool:
         "oracle_rollback_failed",
         "reviewer_rewrite_without_rejected_failed_open",
     }
-
-
-def _is_warning_message(message: str) -> bool:
-    return message.lower().startswith("warning:")
 
 
 def _is_intermediate_event(record: dict[str, Any]) -> bool:
