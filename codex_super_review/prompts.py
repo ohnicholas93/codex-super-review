@@ -4,6 +4,10 @@ import json
 
 from .constants import ORACLE_STATUSES
 
+PROMPT_AUTOMATED_REVIEW_LOOP_START = (
+    "Consider this the starting point of an automated review loop.\n\n"
+)
+
 PROMPT_REVIEW_CHANGES = """Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings. Infer the intended change scope from the diff and surrounding context, and use it to keep findings focused on issues reasonably connected to the change. Avoid drifting into highly unrelated pre-existing issues, broad refactors, or excessive  speculative hardening. Try to be comprehensive and precise so as to not require unnecessarily frequent back-and-forths with the developer.
 
 If you find no actionable issues, your final response must be exactly:

@@ -25,6 +25,7 @@ from .interrupts import GracefulInterruptController
 from .models import BranchReviewScope, RoundDiagnostics
 from .oracle import CodexOracle
 from .prompts import (
+    PROMPT_AUTOMATED_REVIEW_LOOP_START,
     PROMPT_REVIEW_BRANCH,
     PROMPT_REVIEW_CHANGES,
     PROMPT_VALIDATE_BRANCH_FIX_COMMENTS,
@@ -42,6 +43,7 @@ from .reviewer_retries import (
 )
 from .cli_parsers import parse_model_spec
 from .workflow_helpers import _has_round_remaining, no_findings
+
 
 def orchestrate(args: argparse.Namespace) -> int:
     interrupt_controller = GracefulInterruptController()
@@ -375,7 +377,13 @@ def orchestrate(args: argparse.Namespace) -> int:
                         },
                     )
 
-                implementer_prompt = f"{current_prompt}\n\n{current_comments}"
+                loop_prefix = ""
+                if outer_round == 1 and fix_round == 1:
+                    loop_prefix = PROMPT_AUTOMATED_REVIEW_LOOP_START
+
+                implementer_prompt = (
+                    f"{loop_prefix}{current_prompt}\n\n{current_comments}"
+                )
                 fix_result = implementer.fix(implementer_prompt)
                 if (
                     implementer.thread_id is not None
