@@ -17,6 +17,7 @@ class AuditLogger:
         implementer_thread_id: str | None,
         implementer_model: ModelSpec,
         reviewer_model: ModelSpec,
+        oracle_model: ModelSpec,
         event_sink: Any | None = None,
     ) -> None:
         self.enabled = enabled
@@ -24,6 +25,7 @@ class AuditLogger:
         self.implementer_thread_id = implementer_thread_id
         self.implementer_model = implementer_model
         self.reviewer_model = reviewer_model
+        self.oracle_model = oracle_model
         self.event_sink = event_sink if event_sink is not None else NullEventSink()
         self.path: Path | None = None
         self._file = None
@@ -54,6 +56,21 @@ class AuditLogger:
             self._file.close()
             self._file = None
 
+    def finish(self, returncode: int, message: str | None = None) -> None:
+        final_message = message or (
+            "Review complete" if returncode == 0 else f"Review exited with {returncode}"
+        )
+        record = self._base_record(
+            "review_finished",
+            message=final_message,
+        )
+        record["extra"] = {
+            "tui_terminal": True,
+            "returncode": returncode,
+            "final_message": final_message,
+        }
+        self._write_record(record)
+
     def status(self, message: str) -> None:
         self.event_sink.status(message)
 
@@ -65,6 +82,14 @@ class AuditLogger:
         fix_round: int | None = None,
         message: str | None = None,
     ) -> None:
+        record = self._base_record(
+            event,
+            review_round=review_round,
+            fix_round=fix_round,
+            message=message,
+        )
+        record["extra"] = {"tui_status": "running"}
+        self._write_record(record)
         self.event_sink.start(
             event,
             review_round=review_round,
@@ -85,7 +110,34 @@ class AuditLogger:
         message: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
-        record: dict[str, Any] = {
+        record = self._base_record(
+            event,
+            review_round=review_round,
+            fix_round=fix_round,
+            reviewer_thread_id=reviewer_thread_id,
+            prompt=prompt,
+            response=response,
+            result=result,
+            message=message,
+        )
+        if extra is not None:
+            record["extra"] = extra
+        self._write_record(record)
+        self.event_sink.audit(record)
+
+    def _base_record(
+        self,
+        event: str,
+        *,
+        review_round: int | None = None,
+        fix_round: int | None = None,
+        reviewer_thread_id: str | None = None,
+        prompt: str | None = None,
+        response: str | None = None,
+        result: CodexResult | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event": event,
             "cwd": self.cwd,
@@ -94,6 +146,8 @@ class AuditLogger:
             "implementer_reasoning_effort": self.implementer_model.reasoning_effort,
             "reviewer_model": self.reviewer_model.model,
             "reviewer_reasoning_effort": self.reviewer_model.reasoning_effort,
+            "oracle_model": self.oracle_model.model,
+            "oracle_reasoning_effort": self.oracle_model.reasoning_effort,
             "review_round": review_round,
             "fix_round": fix_round,
             "reviewer_thread_id": reviewer_thread_id,
@@ -106,18 +160,22 @@ class AuditLogger:
             "diagnostics": result.diagnostics[-20:] if result is not None else None,
             "message": message,
         }
-        if extra is not None:
-            record["extra"] = extra
+
+    def _write_record(self, record: dict[str, Any]) -> None:
         if self.enabled and self._file is not None:
             try:
                 self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
                 self._file.flush()
             except OSError as exc:
                 self._disable_after_failure(exc)
-        self.event_sink.audit(record)
 
     def _disable_after_failure(self, exc: OSError) -> None:
         self.enabled = False
+        disable_file_backed_rows = getattr(
+            self.event_sink, "disable_file_backed_rows", None
+        )
+        if callable(disable_file_backed_rows):
+            disable_file_backed_rows()
         if not self._failure_warned:
             self.status(f"warning: audit logging disabled after write failure: {exc}")
             self._failure_warned = True

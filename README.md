@@ -58,6 +58,12 @@ For scripts, non-interactive terminals, or legacy stderr-style output:
 codex-super-review --no-tui
 ```
 
+To attach another TUI to a JSONL audit log without starting Codex work:
+
+```bash
+codex-super-review --attach ~/.local/state/codex-super-review/audit/RUN.jsonl
+```
+
 To resume an existing implementer session instead:
 
 ```bash

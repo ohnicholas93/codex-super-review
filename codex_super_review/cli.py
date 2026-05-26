@@ -22,6 +22,7 @@ from .workflow import orchestrate
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="codex-super-review",
+        allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Run iterative Codex reviewer streams against a persistent implementer Codex session.",
         epilog="""Examples:
@@ -31,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --max-fix-rounds-per-reviewer 2
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer-compact-threshold-percent 60
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --write-audit-log true
+  codex-super-review --attach ~/.local/state/codex-super-review/audit/RUN.jsonl
   codex-super-review --branch-base release/2026.05
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --implementer "gpt 5.5 medium" --reviewer "gpt 5.4 xhigh"
   codex-super-review IMPLEMENTER_CODEX_SESSION_ID --oracle "gpt 5.4 mini medium"
@@ -150,12 +152,43 @@ model_reasoning_effort="xhigh".""",
         action="store_true",
         help="Use legacy line-oriented terminal output instead of the interactive TUI.",
     )
+    parser.add_argument(
+        "--attach",
+        metavar="PATH",
+        help="Attach a TUI to an existing JSONL audit log without starting a review.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_args)
+
+    if args.attach is not None:
+        _validate_attach_args(parser, args, raw_args)
+        if not _should_use_tui(args):
+            print(
+                "error: --attach requires an interactive terminal with TUI support",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            from .tui import CursesUnavailable, run_attach_tui
+
+            return run_attach_tui(Path(args.attach))
+        except ImportError as exc:
+            print(f"error: could not import TUI support: {exc}", file=sys.stderr)
+            return 2
+        except CursesUnavailable as exc:
+            print(f"error: could not initialize TUI: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"error: could not read audit log: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"error: invalid audit log: {exc}", file=sys.stderr)
+            return 2
 
     if (
         shutil.which(args.codex_bin) is None
@@ -187,6 +220,44 @@ def main(argv: list[str] | None = None) -> int:
     return _run_with_error_handling(args, args.event_sink)
 
 
+def _validate_attach_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    raw_args: list[str],
+) -> None:
+    conflicts: list[str] = []
+    if args.implementer_codex_session_id is not None:
+        conflicts.append("implementer_codex_session_id")
+    review_options = (
+        "--max-new-reviewer-streams",
+        "--max-fix-rounds-per-reviewer",
+        "--write-audit-log",
+        "--branch-base",
+        "--implementer-compact-threshold-percent",
+        "--implementer",
+        "--implementer-model",
+        "--reviewer",
+        "--reviewer-model",
+        "--oracle",
+        "--oracle-model",
+        "--max-oracle-retries",
+        "--codex-bin",
+        "--no-tui",
+    )
+    for option in review_options:
+        if _option_present(raw_args, option):
+            conflicts.append(option)
+    if conflicts:
+        parser.error(
+            "--attach cannot be combined with review arguments: "
+            + ", ".join(conflicts)
+        )
+
+
+def _option_present(raw_args: list[str], option: str) -> bool:
+    return any(arg == option or arg.startswith(option + "=") for arg in raw_args)
+
+
 def _should_use_tui(args: argparse.Namespace) -> bool:
     term = os.environ.get("TERM", "")
     return (
@@ -201,55 +272,82 @@ def _run_with_error_handling(
     args: argparse.Namespace,
     emit: object,
 ) -> int:
+    args._audit_logger = None
+    code: int | None = None
     try:
-        return orchestrate(args)
+        code = orchestrate(args)
+        return code
     except ValueError as exc:
-        _emit_top_level_error(emit, "error", f"error: {exc}")
-        return 2
+        _emit_top_level_error(args, emit, "error", f"error: {exc}")
+        code = 2
+        return code
     except KeyboardInterrupt:
-        _emit_top_level_error(emit, "interrupted", "Interrupted")
-        return 130
+        _emit_top_level_error(args, emit, "interrupted", "Interrupted")
+        code = 130
+        return code
     except CodexExecutableNotFound as exc:
-        _emit_top_level_error(emit, "error", f"error: {exc}")
-        return 127
+        _emit_top_level_error(args, emit, "error", f"error: {exc}")
+        code = 127
+        return code
     except CodexRunFailure as exc:
         _emit_top_level_error(
+            args,
             emit,
             "codex_run_failure",
             f"error: {exc}",
             details=failure_details_lines(exc.result),
         )
-        return exc.result.returncode or 1
+        code = exc.result.returncode or 1
+        return code
     except CodexResultDiagnostics as exc:
         _emit_top_level_error(
+            args,
             emit,
             "codex_result_diagnostics",
             f"error: {exc}",
             details=failure_details_lines(exc.result),
         )
-        return 1
+        code = 1
+        return code
     except CodexAppServerFailure as exc:
         _emit_top_level_error(
+            args,
             emit,
             "app_server_failure",
             f"error: implementer pre-fix compaction failed: {exc}",
         )
-        return 1
+        code = 1
+        return code
     except LimitReached as exc:
-        _emit_top_level_error(emit, "limit_reached", f"error: {exc}")
-        return 2
+        _emit_top_level_error(args, emit, "limit_reached", f"error: {exc}")
+        code = 2
+        return code
     except RuntimeError as exc:
-        _emit_top_level_error(emit, "runtime_error", f"error: {exc}")
-        return 1
+        _emit_top_level_error(args, emit, "runtime_error", f"error: {exc}")
+        code = 1
+        return code
+    finally:
+        audit = getattr(args, "_audit_logger", None)
+        if audit is not None:
+            if code is not None:
+                message = (
+                    emit.final_message_hint(code)
+                    if hasattr(emit, "final_message_hint")
+                    else None
+                ) or getattr(args, "_top_level_error_message", None)
+                audit.finish(code, message)
+            audit.close()
 
 
 def _emit_top_level_error(
+    args: argparse.Namespace,
     emit: object,
     event: str,
     message: str,
     *,
     details: list[str] | None = None,
 ) -> None:
+    args._top_level_error_message = message
     status = (
         emit.status
         if hasattr(emit, "status")
@@ -261,7 +359,14 @@ def _emit_top_level_error(
     if details:
         for line in details:
             status(line)
-    if hasattr(emit, "audit"):
+    audit = getattr(args, "_audit_logger", None)
+    if audit is not None:
+        audit.log(
+            event,
+            message=message,
+            extra={"diagnostics": details} if details else None,
+        )
+    elif hasattr(emit, "audit"):
         record: dict[str, object] = {
             "event": event,
             "message": message,

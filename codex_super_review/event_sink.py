@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Any
 
 
@@ -78,6 +79,7 @@ class TuiEventSink:
         self._interrupt_controller: Any = None
         self._interrupt_count = 0
         self._abort_requested = False
+        self._file_backed_rows = False
 
     def set_interrupt_controller(self, controller: Any) -> None:
         with self._lock:
@@ -95,6 +97,16 @@ class TuiEventSink:
                 self._headers.pop(key, None)
             else:
                 self._headers[key] = value
+            if key == "Audit log" and value is not None:
+                self._file_backed_rows = True
+
+    def header_value(self, key: str) -> str | None:
+        with self._lock:
+            return self._headers.get(key)
+
+    def disable_file_backed_rows(self) -> None:
+        with self._lock:
+            self._file_backed_rows = False
 
     def status(self, message: str) -> None:
         with self._lock:
@@ -126,6 +138,9 @@ class TuiEventSink:
         message: str | None = None,
     ) -> None:
         with self._lock:
+            if self._file_backed_rows:
+                self._status_message = message or _event_title(event)
+                return
             self._rows.append(
                 TuiRow(
                     id=self._next_id,
@@ -141,12 +156,23 @@ class TuiEventSink:
             self._status_message = message or _event_title(event)
 
     def audit(self, record: dict[str, Any]) -> None:
+        with self._lock:
+            if self._file_backed_rows and record.get("cwd") is not None:
+                return
+        self.apply_audit_record(record)
+
+    def apply_audit_record(self, record: dict[str, Any]) -> None:
         event = str(record.get("event") or "event")
         review_round = _optional_int(record.get("review_round"))
         fix_round = _optional_int(record.get("fix_round"))
         status = _record_status(record)
         message = _record_message(record)
+        record_time = _record_monotonic_time(record)
         with self._lock:
+            if record_time is not None and (
+                not self._rows or record_time < self._started_at
+            ):
+                self._started_at = record_time
             if _is_intermediate_event(record):
                 row = self._find_pending_row(event, review_round, fix_round)
                 if row is not None:
@@ -171,6 +197,14 @@ class TuiEventSink:
             ):
                 row = self._find_latest_pending_row()
             if row is None:
+                row = self._find_duplicate_completed_row(record)
+                if row is not None:
+                    row.status = status
+                    row.message = message
+                    row.record = record.copy()
+                    self._status_message = message
+                    return
+            if row is None:
                 row = TuiRow(
                     id=self._next_id,
                     status=status,
@@ -178,7 +212,7 @@ class TuiEventSink:
                     review_round=review_round,
                     fix_round=fix_round,
                     message=message,
-                    started_at=time.monotonic(),
+                    started_at=record_time if record_time is not None else time.monotonic(),
                 )
                 self._rows.append(row)
                 self._next_id += 1
@@ -186,14 +220,24 @@ class TuiEventSink:
                 row.event = event
             row.status = status
             row.message = message
-            row.completed_at = time.monotonic()
+            row.completed_at = (
+                None
+                if status == "running"
+                else record_time if record_time is not None else time.monotonic()
+            )
             row.record = record.copy()
             self._status_message = message
 
-    def finish(self, returncode: int, message: str | None = None) -> None:
+    def finish(
+        self,
+        returncode: int,
+        message: str | None = None,
+        *,
+        finished_at: float | None = None,
+    ) -> None:
         with self._lock:
             self._finished = True
-            self._finished_at = time.monotonic()
+            self._finished_at = finished_at if finished_at is not None else time.monotonic()
             self._returncode = returncode
             self._final_message = message or (
                 "Review complete" if returncode == 0 else f"Review exited with {returncode}"
@@ -284,6 +328,26 @@ class TuiEventSink:
                 return row
         return None
 
+    def _find_duplicate_completed_row(self, record: dict[str, Any]) -> TuiRow | None:
+        timestamp = record.get("timestamp")
+        if not isinstance(timestamp, str):
+            return None
+        event = record.get("event")
+        review_round = _optional_int(record.get("review_round"))
+        fix_round = _optional_int(record.get("fix_round"))
+        for row in reversed(self._rows):
+            if row.status == "running" or row.record is None:
+                continue
+            row_record = row.record
+            if (
+                row_record.get("timestamp") == timestamp
+                and row_record.get("event") == event
+                and _optional_int(row_record.get("review_round")) == review_round
+                and _optional_int(row_record.get("fix_round")) == fix_round
+            ):
+                return row
+        return None
+
     def _has_latest_row(self, message: str) -> bool:
         return bool(self._rows and self._rows[-1].message == message)
 
@@ -298,6 +362,17 @@ def _event_title(event: str) -> str:
 
 def _record_status(record: dict[str, Any]) -> str:
     event = str(record.get("event") or "")
+    extra = record.get("extra")
+    if isinstance(extra, dict) and extra.get("tui_status") == "running":
+        return "running"
+    if event == "review_finished" and isinstance(extra, dict):
+        returncode = extra.get("returncode")
+        if returncode == 0:
+            return "complete"
+        if returncode == 130:
+            return "warning"
+        if isinstance(returncode, int):
+            return "failed"
     if record.get("codex_exit_code") not in (None, 0):
         return "failed"
     if record.get("codex_errors"):
@@ -353,3 +428,14 @@ def _record_message(record: dict[str, Any]) -> str:
         return response.strip().splitlines()[0][:160]
     event = record.get("event")
     return _event_title(str(event or "event"))
+
+
+def _record_monotonic_time(record: dict[str, Any]) -> float | None:
+    timestamp = record.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp:
+        return None
+    try:
+        wall_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return time.monotonic() + (wall_time.timestamp() - time.time())

@@ -9,15 +9,22 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from .event_sink import TuiEventSink, TuiRow, TuiSnapshot
+from .event_sink import TuiEventSink, TuiRow, TuiSnapshot, _record_monotonic_time
 
 SPINNER = "|/-\\"
 
 
 class CursesUnavailable(RuntimeError):
     pass
+
+
+@dataclass
+class AuditHeaderState:
+    implementer_thread_id: str = ""
 
 
 def run_tui(
@@ -27,6 +34,14 @@ def run_tui(
     sink = TuiEventSink()
     args.event_sink = sink
     result: dict[str, int | None] = {"returncode": None}
+    stop_tail = threading.Event()
+    tail_thread = threading.Thread(
+        target=_tail_active_audit_log,
+        args=(sink, stop_tail),
+        name="codex-super-review-audit-tail",
+        daemon=True,
+    )
+    tail_thread.start()
 
     def worker() -> None:
         try:
@@ -62,9 +77,233 @@ def run_tui(
         if not worker_started["value"]:
             raise CursesUnavailable(str(exc)) from exc
         raise
+    finally:
+        stop_tail.set()
+        tail_thread.join(timeout=1.0)
     if sink.snapshot().abort_requested:
         return 130
     return result["returncode"] if result["returncode"] is not None else 130
+
+
+def run_attach_tui(audit_path: Path) -> int:
+    audit_path = audit_path.expanduser()
+    if not audit_path.is_file():
+        raise OSError(f"{audit_path}: no such file")
+    _validate_attach_audit_log(audit_path)
+    sink = TuiEventSink()
+    sink.header("Audit log", str(audit_path))
+    sink.status(f"Attached to audit log: {audit_path}")
+    stop_tail = threading.Event()
+    tail_thread = threading.Thread(
+        target=_tail_audit_log,
+        args=(sink, audit_path, stop_tail),
+        name="codex-super-review-audit-tail",
+        daemon=True,
+    )
+    tail_thread.start()
+
+    worker_started = {"value": False}
+
+    def worker() -> None:
+        return
+
+    try:
+        curses.wrapper(
+            _curses_main,
+            sink,
+            worker,
+            worker_started,
+            True,
+            False,
+        )
+    except curses.error as exc:
+        raise CursesUnavailable(str(exc)) from exc
+    finally:
+        stop_tail.set()
+        tail_thread.join(timeout=1.0)
+    returncode = sink.snapshot().returncode
+    return returncode if returncode is not None else 0
+
+
+def _tail_active_audit_log(sink: TuiEventSink, stop_event: threading.Event) -> None:
+    try:
+        while not stop_event.is_set():
+            value = sink.header_value("Audit log")
+            if value:
+                _tail_audit_log(sink, Path(value).expanduser(), stop_event)
+                return
+            time.sleep(0.05)
+    except (OSError, ValueError) as exc:
+        sink.disable_file_backed_rows()
+        sink.status(f"warning: audit log tail stopped: {exc}")
+
+
+def _tail_audit_log(
+    sink: TuiEventSink,
+    audit_path: Path,
+    stop_event: threading.Event,
+) -> None:
+    try:
+        header_state = AuditHeaderState()
+        with audit_path.open("rb") as handle:
+            line_number = 0
+            while not stop_event.is_set():
+                position = handle.tell()
+                line = handle.readline()
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                next_line_number = line_number + 1
+                try:
+                    record = _parse_audit_line(audit_path, next_line_number, line)
+                except ValueError as exc:
+                    if not line.endswith(b"\n"):
+                        handle.seek(position)
+                        time.sleep(0.1)
+                        continue
+                    sink.status(f"warning: skipped audit log line: {exc}")
+                    line_number = next_line_number
+                    continue
+                line_number = next_line_number
+                if record is None:
+                    continue
+                _update_audit_headers(sink, audit_path, header_state, record)
+                sink.apply_audit_record(record)
+                terminal = _terminal_record(record)
+                if terminal is not None:
+                    returncode, message = terminal
+                    sink.finish(
+                        returncode,
+                        message,
+                        finished_at=_record_monotonic_time(record),
+                    )
+    except (OSError, ValueError) as exc:
+        sink.disable_file_backed_rows()
+        sink.status(f"warning: audit log tail stopped: {exc}")
+
+
+def _validate_attach_audit_log(audit_path: Path) -> None:
+    deadline = time.monotonic() + 1.0
+    last_error: ValueError | None = None
+    while True:
+        try:
+            _validate_complete_audit_lines(audit_path)
+            return
+        except ValueError as exc:
+            if not _is_trailing_partial_json_error(audit_path, exc):
+                raise
+            last_error = exc
+            if time.monotonic() >= deadline:
+                raise last_error
+            time.sleep(0.05)
+
+
+def _validate_complete_audit_lines(audit_path: Path) -> None:
+    with audit_path.open("rb") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                _parse_audit_line(audit_path, line_number, line)
+            except ValueError as exc:
+                if not line.endswith(b"\n"):
+                    raise ValueError(f"trailing partial JSON: {exc}") from exc
+
+
+def _is_trailing_partial_json_error(audit_path: Path, exc: ValueError) -> bool:
+    if not str(exc).startswith("trailing partial JSON: "):
+        return False
+    try:
+        with audit_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                return False
+            handle.seek(-1, os.SEEK_END)
+            return handle.read(1) != b"\n"
+    except OSError:
+        return False
+
+
+def _parse_audit_line(
+    audit_path: Path,
+    line_number: int,
+    line: bytes | str,
+) -> dict[str, Any] | None:
+    if isinstance(line, bytes):
+        try:
+            line = line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{audit_path}:{line_number}: {exc}") from exc
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        record = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{audit_path}:{line_number}: {exc}") from exc
+    if not isinstance(record, dict):
+        raise ValueError(f"{audit_path}:{line_number}: expected JSON object")
+    return record
+
+
+def _update_audit_headers(
+    sink: TuiEventSink,
+    audit_path: Path,
+    state: AuditHeaderState,
+    record: dict[str, Any],
+) -> None:
+    sink.header("Audit log", str(audit_path))
+    cwd = record.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        sink.header("Review root", _home_relative(cwd))
+    if not state.implementer_thread_id:
+        implementer_thread_id = _record_string(record, "implementer_thread_id")
+        if implementer_thread_id:
+            state.implementer_thread_id = implementer_thread_id
+            sink.header("Implementer", implementer_thread_id)
+    model_summary = _audit_model_summary(record)
+    if model_summary:
+        sink.header("Models I/R/O", model_summary)
+
+
+def _audit_model_summary(record: dict[str, Any]) -> str:
+    implementer = _audit_model_display(record, "implementer")
+    reviewer = _audit_model_display(record, "reviewer")
+    oracle = _audit_model_display(record, "oracle")
+    if not any((implementer, reviewer, oracle)):
+        return ""
+    return f"{implementer or '-'} / {reviewer or '-'} / {oracle or '-'}"
+
+
+def _audit_model_display(record: dict[str, Any], role: str) -> str:
+    model = record.get(f"{role}_model")
+    effort = record.get(f"{role}_reasoning_effort")
+    if not isinstance(model, str) or not model:
+        return ""
+    if isinstance(effort, str) and effort:
+        return f"{model} {effort}"
+    return model
+
+
+def _record_string(record: dict[str, Any], key: str) -> str:
+    value = record.get(key)
+    if isinstance(value, str) and value:
+        return value
+    return ""
+
+
+def _terminal_record(record: dict[str, Any]) -> tuple[int, str | None] | None:
+    extra = record.get("extra")
+    if not isinstance(extra, dict) or extra.get("tui_terminal") is not True:
+        return None
+    returncode = extra.get("returncode")
+    if not isinstance(returncode, int):
+        return None
+    final_message = extra.get("final_message")
+    if isinstance(final_message, str) and final_message:
+        return returncode, final_message
+    message = record.get("message")
+    if isinstance(message, str) and message:
+        return returncode, message
+    return returncode, None
 
 
 def _curses_main(
@@ -72,6 +311,8 @@ def _curses_main(
     sink: TuiEventSink,
     worker: Callable[[], None],
     worker_started: dict[str, bool],
+    ctrl_c_quits: bool = False,
+    terminate_on_exit: bool = True,
 ) -> None:
     try:
         curses.curs_set(0)
@@ -91,7 +332,7 @@ def _curses_main(
     stdscr.keypad(True)
     stdscr.nodelay(True)
 
-    previous_handlers = _install_signal_handlers(sink)
+    previous_handlers = _install_signal_handlers(sink, ctrl_c_quits)
     thread = threading.Thread(
         target=worker,
         name="codex-super-review-worker",
@@ -130,6 +371,7 @@ def _curses_main(
                     detail_row_id,
                     detail_scroll,
                     tick,
+                    ctrl_c_quits,
                 )
                 tick += 1
 
@@ -138,7 +380,7 @@ def _curses_main(
                 if key == -1:
                     pass
                 elif key == 3:
-                    if snapshot.finished:
+                    if ctrl_c_quits or snapshot.finished:
                         break
                     sink.request_interrupt()
                 elif view == "detail":
@@ -167,22 +409,25 @@ def _curses_main(
                     time.sleep(0.1)
             except KeyboardInterrupt:
                 snapshot = sink.snapshot()
-                if snapshot.finished:
+                if ctrl_c_quits or snapshot.finished:
                     break
                 sink.request_interrupt()
     finally:
-        if not sink.snapshot().finished:
+        if terminate_on_exit and not sink.snapshot().finished:
             sink.terminate_active_process()
         _restore_signal_handlers(previous_handlers)
         thread.join(timeout=3.0)
 
 
-def _install_signal_handlers(sink: TuiEventSink) -> dict[int, signal.Handlers]:
+def _install_signal_handlers(
+    sink: TuiEventSink,
+    ctrl_c_quits: bool = False,
+) -> dict[int, signal.Handlers]:
     previous_handlers: dict[int, signal.Handlers] = {}
 
     def handle_signal(signum: int, frame: object) -> None:
         if signum == signal.SIGINT:
-            if sink.snapshot().finished:
+            if ctrl_c_quits or sink.snapshot().finished:
                 raise KeyboardInterrupt
             sink.request_interrupt()
             return
@@ -275,6 +520,7 @@ def _draw(
     detail_row_id: int | None,
     detail_scroll: int,
     tick: int,
+    ctrl_c_quits: bool = False,
 ) -> None:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
@@ -299,7 +545,15 @@ def _draw(
         _add(stdscr, y, 0, _clip(line, width))
         y += 1
 
-    if snapshot.finished:
+    if ctrl_c_quits and not snapshot.finished:
+        _add(
+            stdscr,
+            y,
+            0,
+            "Attached - press Ctrl+C to quit",
+            _color(5) | curses.A_BOLD,
+        )
+    elif snapshot.finished:
         _add(
             stdscr,
             y,
@@ -416,9 +670,13 @@ def _detail_lines(
     detail_row_id: int | None,
     width: int,
 ) -> list[str]:
-    row = next((item for item in snapshot.rows if item.id == detail_row_id), None)
-    if row is None:
+    row_index = next(
+        (index for index, item in enumerate(snapshot.rows) if item.id == detail_row_id),
+        None,
+    )
+    if row_index is None:
         return ["No row selected"]
+    row = snapshot.rows[row_index]
     record = row.record or {}
     lines = [
         "",

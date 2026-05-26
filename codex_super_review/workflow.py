@@ -66,8 +66,10 @@ def orchestrate(args: argparse.Namespace) -> int:
         args.implementer_codex_session_id,
         implementer_model,
         reviewer_model,
+        oracle_model,
         event_sink,
     )
+    args._audit_logger = audit
     round_diagnostics: list[RoundDiagnostics] = []
     implementer_responses: list[str] = []
     branch_scope: BranchReviewScope | None = None
@@ -361,11 +363,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                     )
 
                 loop_prefix = ""
-                if (
-                    args.implementer_codex_session_id is None
-                    and outer_round == 1
-                    and fix_round == 1
-                ):
+                if outer_round == 1 and fix_round == 1:
                     loop_prefix = PROMPT_AUTOMATED_REVIEW_LOOP_START
 
                 implementer_prompt = (
@@ -494,7 +492,6 @@ def orchestrate(args: argparse.Namespace) -> int:
         try:
             if oracle_client is not None:
                 oracle_client.close()
-            audit.close()
         finally:
             interrupt_controller.__exit__(None, None, None)
 
