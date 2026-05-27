@@ -145,6 +145,8 @@ class TuiEventSink:
                     row = self._find_pending_row(
                         pending_event, review_round, fix_round
                     )
+                    if row is not None and row.event != event:
+                        self._move_row_to_end(row)
             if row is None and status in {"failed", "warning"}:
                 row = self._find_related_pending_row(review_round, fix_round)
             if (
@@ -277,6 +279,13 @@ class TuiEventSink:
             if row.status == "running":
                 return row
         return None
+
+    def _move_row_to_end(self, row: TuiRow) -> None:
+        try:
+            self._rows.remove(row)
+        except ValueError:
+            return
+        self._rows.append(row)
 
 
 def _optional_int(value: Any) -> int | None:
